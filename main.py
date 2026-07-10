@@ -1,0 +1,973 @@
+# main.py
+"""
+Main pipeline for behavioral credit risk scoring system.
+Supports module-by-module execution with Dask for modeling.
+"""
+
+import os
+import sys
+import logging
+import argparse
+import warnings
+warnings.filterwarnings('ignore')
+
+import pandas as pd
+import numpy as np
+import dask.dataframe as dd
+from dask.distributed import Client
+from pyspark.sql import SparkSession
+from datetime import datetime
+import pickle
+import json
+from typing import Optional, Dict, Any
+
+# Import project modules
+from config.config import config
+from data_ingestion.data_ingestion import SFLLDDataIngestion, create_spark_session
+from preprocessing.cleaning import SFLLDDataCleaner
+from features.behavioral_features import BehavioralFeatureEngineer
+from target.target_creation import TargetCreator
+from datasets.dataset_creation import DatasetCreator
+from validation.splitter import DataSplitter
+
+# Import Dask-based models
+from models.logistic import LogisticRegressionModel
+from models.random_forest import RandomForestModel
+from models.xgboost_model import XGBoostModel
+from models.lightgbm_model import LightGBMModel
+from models.catboost_model import CatBoostModel
+from models.ensemble import StackingEnsemble
+from models.hyperparameter_tuning import HyperparameterTuner
+
+# Import evaluation modules
+from evaluation.metrics import CreditRiskMetrics
+from evaluation.calibration import ProbabilityCalibrator
+from evaluation.plots import CreditRiskVisualizer
+
+# Import scoring
+from scoring.score_generator import CreditScoreGenerator
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('credit_risk_modeling.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class CreditRiskPipeline:
+    """
+    Main pipeline orchestrator for credit risk modeling.
+    Supports module-by-module execution with Dask for modeling.
+    """
+    
+    def __init__(
+        self, 
+        spark: Optional[SparkSession] = None, 
+        skip_data: bool = False,
+        n_workers: int = 4,
+        threads_per_worker: int = 2
+    ):
+        """
+        Initialize the pipeline.
+        
+        Args:
+            spark: Optional SparkSession. If None, creates a new one.
+            skip_data: If True, skip all data preparation and use existing data.
+            n_workers: Number of Dask workers
+            threads_per_worker: Threads per Dask worker
+        """
+        self.spark = spark or create_spark_session()
+        self.paths = config['paths']
+        self.model_config = config['model']
+        self.feature_config = config['features']
+        self.skip_data = skip_data
+        
+        # Initialize Spark components
+        self.ingestor = SFLLDDataIngestion(self.spark)
+        self.cleaner = SFLLDDataCleaner(self.spark)
+        self.feature_engineer = BehavioralFeatureEngineer(self.spark)
+        self.target_creator = TargetCreator(
+            spark=self.spark,
+            default_threshold=self.model_config.default_threshold,
+            lookahead_months=self.model_config.lookahead_months
+        )
+        self.splitter = DataSplitter(self.spark)
+        
+        # Initialize Dask client
+        logger.info("Initializing Dask client...")
+        try:
+            self.dask_client = Client(n_workers=n_workers, threads_per_worker=threads_per_worker)
+            logger.info(f"Dask client initialized with {n_workers} workers")
+        except Exception as e:
+            logger.warning(f"Could not initialize Dask client: {e}. Using single-threaded mode.")
+            self.dask_client = None
+        
+        # State tracking
+        self.state = {
+            'origination_df': None,
+            'performance_df': None,
+            'orig_cleaned': None,
+            'perf_cleaned': None,
+            'feature_df': None,
+            'dataset_df': None,
+            'train_df': None,
+            'val_df': None,
+            'test_df': None,
+            'X_train': None,      # Dask DataFrame
+            'y_train': None,      # Dask Series
+            'X_val': None,        # Dask DataFrame
+            'y_val': None,        # Dask Series
+            'X_test': None,       # Dask DataFrame
+            'y_test': None,       # Dask Series
+            'models': {},
+            'tuned_params': {},
+            'results': {},
+            'calibrated_models': {},
+            'data_loaded': False,
+            'feature_names': None
+        }
+        
+        # Track which modules have been completed
+        self.completed_modules = set()
+        
+        # Create directories
+        self._create_directories()
+        
+        # If skip_data is True, try to load existing data
+        if skip_data:
+            self._load_existing_data()
+        
+    def _create_directories(self):
+        """Create necessary directories."""
+        dirs = [
+            self.paths.bronze_dir,
+            self.paths.silver_dir,
+            self.paths.features_dir,
+            self.paths.models_dir,
+            self.paths.results_dir,
+            self.paths.eda_dir
+        ]
+        for d in dirs:
+            os.makedirs(d, exist_ok=True)
+    
+    def _load_existing_data(self) -> bool:
+        """
+        Load existing data from parquet as Dask DataFrames.
+        
+        Returns:
+            True if data was loaded successfully, False otherwise.
+        """
+        logger.info("Attempting to load existing data...")
+        
+        try:
+            # Load parquet files as Dask DataFrames
+            self.state['X_train'] = dd.read_parquet(f"{self.paths.features_dir}/dask_X_train.parquet")
+            self.state['y_train'] = dd.read_parquet(f"{self.paths.features_dir}/dask_y_train.parquet")
+            self.state['X_test'] = dd.read_parquet(f"{self.paths.features_dir}/dask_X_test.parquet")
+            self.state['y_test'] = dd.read_parquet(f"{self.paths.features_dir}/dask_y_test.parquet")
+            
+            # Load validation data if available
+            if os.path.exists(f"{self.paths.features_dir}/dask_X_val.parquet"):
+                self.state['X_val'] = dd.read_parquet(f"{self.paths.features_dir}/dask_X_val.parquet")
+                self.state['y_val'] = dd.read_parquet(f"{self.paths.features_dir}/dask_y_val.parquet")
+            
+            # Get feature names
+            self.state['feature_names'] = self.state['X_train'].columns.tolist()
+            
+            self.state['data_loaded'] = True
+            logger.info(f"Successfully loaded existing data:")
+            logger.info(f"  Train: {self.state['X_train'].shape[0].compute():,} records")
+            logger.info(f"  Test: {self.state['X_test'].shape[0].compute():,} records")
+            if self.state['X_val'] is not None:
+                logger.info(f"  Validation: {self.state['X_val'].shape[0].compute():,} records")
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Could not load existing data: {e}")
+            self.state['data_loaded'] = False
+            return False
+    
+    def _save_dask_data(self):
+        """Save Dask DataFrames to parquet."""
+        logger.info("Saving Dask DataFrames to parquet...")
+        
+        dask_dir = f"{self.paths.features_dir}"
+        
+        self.state['X_train'].to_parquet(f"{dask_dir}/dask_X_train.parquet", write_index=False)
+        self.state['y_train'].to_parquet(f"{dask_dir}/dask_y_train.parquet", write_index=False)
+        
+        if self.state['X_val'] is not None:
+            self.state['X_val'].to_parquet(f"{dask_dir}/dask_X_val.parquet", write_index=False)
+            self.state['y_val'].to_parquet(f"{dask_dir}/dask_y_val.parquet", write_index=False)
+        
+        self.state['X_test'].to_parquet(f"{dask_dir}/dask_X_test.parquet", write_index=False)
+        self.state['y_test'].to_parquet(f"{dask_dir}/dask_y_test.parquet", write_index=False)
+        
+        logger.info("Dask DataFrames saved successfully")
+    
+    def _ensure_data_loaded(self, required_for: str = "modeling"):
+        """
+        Ensure data is loaded as Dask DataFrames.
+        """
+        if self.state['data_loaded']:
+            return
+        
+        if self.skip_data:
+            if self._load_existing_data():
+                return
+            else:
+                raise RuntimeError(
+                    f"Cannot proceed with {required_for}. Data not found and --skip_data is True. "
+                    f"Please run data preparation first or remove --skip_data flag."
+                )
+        
+        # Run dataset creation if needed
+        if self.state['train_df'] is None:
+            self._run_dataset_creation()
+        
+        # Convert Spark DataFrames to Dask DataFrames
+        self._spark_to_dask()
+    
+    def _spark_to_dask(self):
+        """Convert Spark DataFrames to Dask DataFrames."""
+        logger.info("Converting Spark DataFrames to Dask DataFrames...")
+        
+        # Convert each split to pandas then Dask
+        def spark_to_dask(spark_df, sample_size=0.1):
+            """Convert Spark DataFrame to Dask DataFrame with sampling if needed."""
+            # Sample if too large
+            total_count = spark_df.count()
+            if total_count > 1000000:
+                frac = min(0.2, 1000000 / total_count)
+                spark_df = spark_df.sample(fraction=frac, seed=42)
+            
+            # Convert to pandas
+            pdf = spark_df.toPandas()
+            
+            # Convert to Dask
+            return dd.from_pandas(pdf, npartitions=4)
+        
+        # Convert training data
+        if self.state['train_df'] is not None:
+            # Drop non-feature columns
+            drop_cols = ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD']
+            X_train_df = self.state['train_df'].drop(*[c for c in drop_cols if c in self.state['train_df'].columns])
+            
+            # Separate features and target
+            X_train = spark_to_dask(X_train_df.drop('target'))
+            y_train = spark_to_dask(self.state['train_df'].select('target'))
+            
+            self.state['X_train'] = X_train
+            self.state['y_train'] = y_train['target']
+            self.state['feature_names'] = X_train.columns.tolist()
+        
+        # Convert validation data
+        if self.state['val_df'] is not None:
+            drop_cols = ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD']
+            X_val_df = self.state['val_df'].drop(*[c for c in drop_cols if c in self.state['val_df'].columns])
+            
+            X_val = spark_to_dask(X_val_df.drop('target'))
+            y_val = spark_to_dask(self.state['val_df'].select('target'))
+            
+            self.state['X_val'] = X_val
+            self.state['y_val'] = y_val['target']
+        
+        # Convert test data
+        if self.state['test_df'] is not None:
+            drop_cols = ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD']
+            X_test_df = self.state['test_df'].drop(*[c for c in drop_cols if c in self.state['test_df'].columns])
+            
+            X_test = spark_to_dask(X_test_df.drop('target'))
+            y_test = spark_to_dask(self.state['test_df'].select('target'))
+            
+            self.state['X_test'] = X_test
+            self.state['y_test'] = y_test['target']
+        
+        self.state['data_loaded'] = True
+        
+        # Save Dask data
+        self._save_dask_data()
+        
+        logger.info("Spark to Dask conversion completed")
+    
+    def run_module(self, module: str, **kwargs):
+        """
+        Run a specific module of the pipeline.
+        
+        Args:
+            module: Module name
+            **kwargs: Additional arguments for the module
+        """
+        module_map = {
+            'ingestion': self._run_ingestion,
+            'cleaning': self._run_cleaning,
+            'feature_engineering': self._run_feature_engineering,
+            'target_creation': self._run_target_creation,
+            'dataset_creation': self._run_dataset_creation,
+            'tuning': self._run_tuning,
+            'training': self._run_training,
+            'evaluation': self._run_evaluation,
+            'calibration': self._run_calibration,
+            'scoring': self._run_scoring,
+            'visualization': self._run_visualization,
+            'full': self._run_full_pipeline
+        }
+        
+        if module not in module_map:
+            raise ValueError(f"Unknown module: {module}. Available: {list(module_map.keys())}")
+        
+        logger.info("=" * 80)
+        logger.info(f"RUNNING MODULE: {module.upper()}")
+        if self.skip_data:
+            logger.info("NOTE: --skip_data is enabled. Using existing data only.")
+        logger.info("=" * 80)
+        
+        module_map[module](**kwargs)
+        
+        self.completed_modules.add(module)
+        
+        logger.info("=" * 80)
+        logger.info(f"MODULE {module.upper()} COMPLETED")
+        logger.info("=" * 80)
+    
+    # =========================================================================
+    # SPARK MODULES (Unchanged - kept as reference)
+    # =========================================================================
+    
+    def _run_ingestion(self, **kwargs):
+        """Run data ingestion module."""
+        if self.skip_data:
+            logger.info("SKIPPING ingestion (--skip_data is enabled)")
+            return
+        
+        logger.info("Running Data Ingestion Module...")
+        raw_dir = kwargs.get('raw_dir', self.paths.raw_dir)
+        years = kwargs.get('years', list(range(1999, 2013)))
+        force = kwargs.get('force', False)
+        
+        if not force and self._check_bronze_exists():
+            logger.info("Bronze data already exists. Loading...")
+            self.state['origination_df'] = self.spark.read.parquet(self.paths.origination_bronze)
+            self.state['performance_df'] = self.spark.read.parquet(self.paths.performance_bronze)
+            return
+        
+        self.state['origination_df'] = self.ingestor.ingest_all_years(
+            raw_dir=raw_dir, years=years, bronze_dir=self.paths.bronze_dir,
+            file_prefix="sample", data_type="origination"
+        )
+        self.state['performance_df'] = self.ingestor.ingest_all_years(
+            raw_dir=raw_dir, years=years, bronze_dir=self.paths.bronze_dir,
+            file_prefix="sample", data_type="performance"
+        )
+    
+    def _run_cleaning(self, **kwargs):
+        """Run data cleaning module."""
+        if self.skip_data:
+            logger.info("SKIPPING cleaning (--skip_data is enabled)")
+            return
+        
+        logger.info("Running Data Cleaning Module...")
+        force = kwargs.get('force', False)
+        
+        if self.state['origination_df'] is None:
+            self.state['origination_df'] = self.spark.read.parquet(self.paths.origination_bronze)
+        if self.state['performance_df'] is None:
+            self.state['performance_df'] = self.spark.read.parquet(self.paths.performance_bronze)
+        
+        self.state['orig_cleaned'], self.state['perf_cleaned'] = self.cleaner.clean_both_datasets(
+            self.state['origination_df'], self.state['performance_df']
+        )
+        
+        self.state['orig_cleaned'].write.mode("overwrite").option("compression", "snappy") \
+            .parquet(f"{self.paths.silver_dir}/origination_cleaned.parquet")
+        self.state['perf_cleaned'].write.mode("overwrite").option("compression", "snappy") \
+            .parquet(f"{self.paths.silver_dir}/performance_cleaned.parquet")
+    
+    def _run_feature_engineering(self, **kwargs):
+        """Run feature engineering module."""
+        if self.skip_data:
+            logger.info("SKIPPING feature engineering (--skip_data is enabled)")
+            return
+        
+        logger.info("Running Feature Engineering Module...")
+        force = kwargs.get('force', False)
+        
+        if self.state['orig_cleaned'] is None:
+            self.state['orig_cleaned'] = self.spark.read.parquet(f"{self.paths.silver_dir}/origination_cleaned.parquet")
+            self.state['perf_cleaned'] = self.spark.read.parquet(f"{self.paths.silver_dir}/performance_cleaned.parquet")
+        
+        feature_df = self.feature_engineer.create_all_features(
+            self.state['orig_cleaned'], self.state['perf_cleaned']
+        )
+        
+        seen = set()
+        cols_to_keep = []
+        for col_name in feature_df.columns:
+            if col_name not in seen:
+                seen.add(col_name)
+                cols_to_keep.append(col_name)
+        feature_df = feature_df.select(*cols_to_keep)
+        
+        self.state['feature_df'] = feature_df
+        
+        feature_df.write.mode("overwrite").option("compression", "snappy") \
+            .parquet(self.paths.feature_dataset)
+    
+    def _run_target_creation(self, **kwargs):
+        """Run target creation module."""
+        if self.skip_data:
+            logger.info("SKIPPING target creation (--skip_data is enabled)")
+            return
+        
+        logger.info("Running Target Creation Module...")
+        threshold = kwargs.get('threshold', self.model_config.default_threshold)
+        
+        if self.state['feature_df'] is None:
+            self.state['feature_df'] = self.spark.read.parquet(self.paths.feature_dataset)
+        
+        self.target_creator.default_threshold = threshold
+        self.state['dataset_df'] = self.target_creator.create_target(
+            self.state['feature_df'], threshold=threshold
+        )
+        
+        self.target_creator.analyze_target_distribution(self.state['dataset_df'])
+        
+        self.state['dataset_df'].write.mode("overwrite").option("compression", "snappy") \
+            .parquet(f"{self.paths.features_dir}/dataset_with_target.parquet")
+    
+    def _run_dataset_creation(self, **kwargs):
+        """Run dataset creation module."""
+        if self.skip_data:
+            logger.info("SKIPPING dataset creation (--skip_data is enabled)")
+            if self._load_existing_data():
+                return
+            raise RuntimeError(
+                "Cannot run dataset creation with --skip_data. "
+                "Data not found in parquet files."
+            )
+        
+        logger.info("Running Dataset Creation Module...")
+        
+        if self.state['dataset_df'] is None:
+            self.state['dataset_df'] = self.spark.read.parquet(f"{self.paths.features_dir}/dataset_with_target.parquet")
+        
+        dataset_creator = DatasetCreator(self.spark)
+        self.state['train_df'], self.state['val_df'], self.state['test_df'] = dataset_creator.create_dataset()
+        
+        # Convert to Dask
+        self._spark_to_dask()
+    
+    def _check_bronze_exists(self) -> bool:
+        """Check if bronze data already exists."""
+        try:
+            self.spark.read.parquet(self.paths.origination_bronze)
+            self.spark.read.parquet(self.paths.performance_bronze)
+            return True
+        except:
+            return False
+    
+    # =========================================================================
+    # DASK MODELING MODULES
+    # =========================================================================
+    
+    def _run_tuning(self, **kwargs):
+        """Run hyperparameter tuning module with Dask."""
+        logger.info("Running Hyperparameter Tuning Module with Dask...")
+        
+        self._ensure_data_loaded("tuning")
+        
+        n_trials = kwargs.get('n_trials', self.model_config.n_trials)
+        
+        # Check if tuning already done
+        tuned_params_path = f"{self.paths.results_dir}/tuned_params.json"
+        if os.path.exists(tuned_params_path) and not kwargs.get('force', False):
+            logger.info("Tuned parameters already exist. Loading...")
+            with open(tuned_params_path, 'r') as f:
+                self.state['tuned_params'] = json.load(f)
+            return
+        
+        # Create tuner with sampling
+        tuner = HyperparameterTuner(
+            n_trials=min(n_trials, 30),
+            cv_folds=min(3, self.model_config.cv_folds),
+            random_state=self.model_config.random_state,
+            sample_fraction=0.1  # Use 10% for tuning
+        )
+        
+        tuned_params = {}
+        
+        # Tune each model
+        models_to_tune = [
+            ('logistic', tuner.tune_logistic_regression),
+            ('random_forest', tuner.tune_random_forest),
+            ('xgboost', tuner.tune_xgboost),
+            ('lightgbm', tuner.tune_lightgbm),
+            ('catboost', tuner.tune_catboost)
+        ]
+        
+        for name, tune_func in models_to_tune:
+            logger.info(f"\nTuning {name}...")
+            try:
+                params = tune_func(self.state['X_train'], self.state['y_train'])
+                tuned_params[name] = params
+                logger.info(f"  ✅ {name} tuning completed")
+            except Exception as e:
+                logger.warning(f"Could not tune {name}: {e}")
+                tuned_params[name] = {}
+        
+        self.state['tuned_params'] = tuned_params
+        
+        with open(tuned_params_path, 'w') as f:
+            json.dump(tuned_params, f, indent=2)
+        
+        logger.info("Hyperparameter tuning completed.")
+    
+    def _run_training(self, **kwargs):
+        """Run model training module with Dask."""
+        logger.info("Running Model Training Module with Dask...")
+        
+        self._ensure_data_loaded("training")
+        
+        use_tuned_params = kwargs.get('use_tuned_params', True)
+        force = kwargs.get('force', False)
+        
+        if not force and self._check_models_exist():
+            logger.info("Models already exist. Loading...")
+            self._load_models()
+            return
+        
+        # Load tuned parameters
+        tuned_params = {}
+        if use_tuned_params:
+            try:
+                with open(f"{self.paths.results_dir}/tuned_params.json", 'r') as f:
+                    tuned_params = json.load(f)
+                logger.info("Loaded tuned parameters")
+            except:
+                logger.warning("No tuned parameters found, using defaults")
+        
+        models = {}
+        
+        # 1. Logistic Regression
+        logger.info("\nTraining Logistic Regression with Dask...")
+        lr = LogisticRegressionModel(
+            random_state=self.model_config.random_state,
+            **tuned_params.get('logistic', {})
+        )
+        lr.fit(self.state['X_train'], self.state['y_train'])
+        models['logistic'] = lr
+        
+        # 2. Random Forest
+        logger.info("\nTraining Random Forest with Dask...")
+        rf = RandomForestModel(
+            random_state=self.model_config.random_state,
+            **tuned_params.get('random_forest', {})
+        )
+        rf.fit(self.state['X_train'], self.state['y_train'])
+        models['random_forest'] = rf
+        
+        # 3. XGBoost
+        logger.info("\nTraining XGBoost with Dask...")
+        xgb = XGBoostModel(
+            random_state=self.model_config.random_state,
+            **tuned_params.get('xgboost', {})
+        )
+        xgb.fit(
+            self.state['X_train'], self.state['y_train'],
+            self.state['X_val'], self.state['y_val']
+        )
+        models['xgboost'] = xgb
+        
+        # 4. LightGBM
+        logger.info("\nTraining LightGBM with Dask...")
+        lgb = LightGBMModel(
+            random_state=self.model_config.random_state,
+            **tuned_params.get('lightgbm', {})
+        )
+        lgb.fit(
+            self.state['X_train'], self.state['y_train'],
+            self.state['X_val'], self.state['y_val']
+        )
+        models['lightgbm'] = lgb
+        
+        # 5. CatBoost
+        logger.info("\nTraining CatBoost...")
+        cat = CatBoostModel(
+            random_state=self.model_config.random_state,
+            **tuned_params.get('catboost', {})
+        )
+        cat.fit(
+            self.state['X_train'], self.state['y_train'],
+            self.state['X_val'], self.state['y_val']
+        )
+        models['catboost'] = cat
+        
+        # 6. Ensemble
+        if len(models) >= 2:
+            logger.info("\nTraining Stacking Ensemble with Dask...")
+            ensemble = StackingEnsemble(
+                base_models=list(models.values()),
+                meta_model=LightGBMModel(
+                    random_state=self.model_config.random_state,
+                    is_unbalance=True
+                ),
+                cv_folds=min(3, self.model_config.cv_folds),
+                random_state=self.model_config.random_state
+            )
+            ensemble.fit(
+                self.state['X_train'], self.state['y_train'],
+                self.state['X_val'], self.state['y_val']
+            )
+            models['ensemble'] = ensemble
+        
+        self.state['models'] = models
+        self._save_models(models)
+        
+        logger.info(f"Training completed. Models: {list(models.keys())}")
+    
+    def _run_evaluation(self, **kwargs):
+        """Run model evaluation module with Dask."""
+        logger.info("Running Model Evaluation Module with Dask...")
+        
+        self._ensure_data_loaded("evaluation")
+        
+        if not self.state['models']:
+            if self.skip_data:
+                self._load_models()
+            else:
+                logger.warning("Models not trained. Running training first...")
+                self._run_training()
+        
+        results = {}
+        metrics_calculator = CreditRiskMetrics()
+        
+        for name, model in self.state['models'].items():
+            logger.info(f"\nEvaluating {name}...")
+            
+            # Get predictions (returns numpy arrays)
+            y_proba = model.predict_proba(self.state['X_test'])[:, 1]
+            y_pred = model.predict(self.state['X_test'])
+            
+            # Get y_test as numpy
+            y_test_np = self.state['y_test'].compute().values
+            
+            # Compute metrics
+            metrics = metrics_calculator.evaluate(y_test_np, y_pred, y_proba)
+            metrics['name'] = name
+            
+            if hasattr(model, 'get_feature_importance'):
+                metrics['feature_importance'] = model.get_feature_importance()
+            
+            lift_data = metrics_calculator.compute_lift_gain(y_test_np, y_proba)
+            metrics['lift_data'] = lift_data
+            
+            results[name] = metrics
+            
+            logger.info(f"  ROC-AUC: {metrics['roc_auc']:.4f}")
+            logger.info(f"  PR-AUC: {metrics['pr_auc']:.4f}")
+            logger.info(f"  F1: {metrics['f1']:.4f}")
+            logger.info(f"  KS: {metrics['ks_statistic']:.4f}")
+        
+        self.state['results'] = results
+        
+        # Save results
+        results_df = pd.DataFrame([
+            {
+                'model': name,
+                'roc_auc': metrics['roc_auc'],
+                'pr_auc': metrics['pr_auc'],
+                'f1': metrics['f1'],
+                'precision': metrics['precision'],
+                'recall': metrics['recall'],
+                'balanced_accuracy': metrics['balanced_accuracy'],
+                'mcc': metrics['mcc'],
+                'brier_score': metrics['brier_score'],
+                'log_loss': metrics['log_loss'],
+                'ks_statistic': metrics['ks_statistic']
+            }
+            for name, metrics in results.items()
+        ])
+        results_df.to_csv(f"{self.paths.results_dir}/model_results.csv", index=False)
+        
+        # Summary table
+        logger.info("\nMODEL PERFORMANCE SUMMARY:")
+        logger.info("-" * 80)
+        logger.info(f"{'Model':<20} {'ROC-AUC':<10} {'PR-AUC':<10} {'F1':<10} {'KS':<10}")
+        logger.info("-" * 80)
+        for _, row in results_df.iterrows():
+            logger.info(
+                f"{row['model']:<20} {row['roc_auc']:<10.4f} {row['pr_auc']:<10.4f} "
+                f"{row['f1']:<10.4f} {row['ks_statistic']:<10.4f}"
+            )
+        logger.info("-" * 80)
+    
+    def _run_calibration(self, **kwargs):
+        """Run probability calibration module with Dask."""
+        logger.info("Running Probability Calibration Module with Dask...")
+        
+        self._ensure_data_loaded("calibration")
+        
+        if not self.state['models']:
+            if self.skip_data:
+                self._load_models()
+            else:
+                logger.warning("Models not trained. Running training first...")
+                self._run_training()
+        
+        calibrated_models = {}
+        
+        for name, model in self.state['models'].items():
+            logger.info(f"\nCalibrating {name}...")
+            
+            calibrator = ProbabilityCalibrator(method='isotonic')
+            calibrated_model = calibrator.calibrate(
+                model,
+                self.state['X_train'],
+                self.state['y_train'],
+                self.state['X_val'],
+                self.state['y_val']
+            )
+            calibrated_models[f"{name}_calibrated"] = calibrated_model
+        
+        self.state['calibrated_models'] = calibrated_models
+        
+        for name, model in calibrated_models.items():
+            with open(f"{self.paths.models_dir}/model_{name}.pkl", 'wb') as f:
+                pickle.dump(model, f)
+            logger.info(f"Saved {name} model")
+    
+    def _run_scoring(self, **kwargs):
+        """Run credit score generation module."""
+        logger.info("Running Credit Score Generation Module with Dask...")
+        
+        self._ensure_data_loaded("scoring")
+        
+        if not self.state['models']:
+            if self.skip_data:
+                self._load_models()
+            else:
+                logger.warning("Models not trained. Running training first...")
+                self._run_training()
+        
+        ensemble = self.state['models'].get('ensemble')
+        if ensemble is None:
+            ensemble = self.state['models'].get('lightgbm')
+        
+        if ensemble is None:
+            raise RuntimeError("No model available for scoring")
+        
+        # Get probabilities (returns numpy)
+        y_proba = ensemble.predict_proba(self.state['X_test'])[:, 1]
+        y_test_np = self.state['y_test'].compute().values
+        
+        score_generator = CreditScoreGenerator(
+            min_score=300, max_score=900,
+            target_default_rate=0.05, pdo=20
+        )
+        
+        results_df = pd.DataFrame({
+            'probability': y_proba,
+            'true_label': y_test_np
+        })
+        
+        results_df = score_generator.generate_all_scores(
+            results_df, prob_col='probability', score_col='credit_score'
+        )
+        
+        distribution = score_generator.get_score_distribution(results_df)
+        logger.info("\nScore Distribution:")
+        for key, value in distribution.items():
+            if key != 'percentiles':
+                logger.info(f"  {key}: {value:.2f}")
+        
+        results_df.to_csv(f"{self.paths.results_dir}/scores.csv", index=False)
+        self.state['score_results'] = results_df
+    
+    def _run_visualization(self, **kwargs):
+        """Run visualization module."""
+        logger.info("Running Visualization Module...")
+        
+        if not self.state['results']:
+            if self.skip_data:
+                try:
+                    results_df = pd.read_csv(f"{self.paths.results_dir}/model_results.csv")
+                    self.state['results'] = results_df.to_dict('records')
+                except:
+                    raise RuntimeError("Results not found. Please run evaluation first.")
+            else:
+                logger.warning("Evaluation results not available. Running evaluation first...")
+                self._run_evaluation()
+        
+        visualizer = CreditRiskVisualizer(save_dir=f"{self.paths.results_dir}/plots")
+        
+        if isinstance(self.state['results'], dict):
+            for name, metrics in self.state['results'].items():
+                if 'feature_importance' in metrics:
+                    visualizer.create_model_evaluation_report(
+                        self.state['y_test'].compute().values,
+                        metrics.get('y_proba'),
+                        metrics.get('y_pred'),
+                        name,
+                        metrics.get('feature_importance'),
+                        save_name=f"{name}_report"
+                    )
+            
+            visualizer.create_ensemble_comparison_plot(
+                self.state['results'],
+                save_name="ensemble_comparison"
+            )
+        
+        logger.info("Visualizations created successfully")
+    
+    def _run_full_pipeline(self):
+        """Run the complete pipeline from ingestion to visualization."""
+        logger.info("Running Full Pipeline...")
+        
+        modules = [
+            'ingestion', 'cleaning', 'feature_engineering', 'target_creation',
+            'dataset_creation', 'tuning', 'training', 'evaluation',
+            'calibration', 'scoring', 'visualization'
+        ]
+        
+        for module in modules:
+            self.run_module(module)
+        
+        logger.info("Full pipeline completed successfully!")
+    
+    def _check_models_exist(self) -> bool:
+        """Check if models already exist."""
+        model_names = ['logistic', 'random_forest', 'xgboost', 'lightgbm', 'catboost', 'ensemble']
+        for name in model_names:
+            if not os.path.exists(f"{self.paths.models_dir}/model_{name}.pkl"):
+                return False
+        return True
+    
+    def _load_models(self):
+        """Load existing models from disk."""
+        model_names = ['logistic', 'random_forest', 'xgboost', 'lightgbm', 'catboost', 'ensemble']
+        for name in model_names:
+            try:
+                with open(f"{self.paths.models_dir}/model_{name}.pkl", 'rb') as f:
+                    self.state['models'][name] = pickle.load(f)
+                logger.info(f"Loaded {name} model")
+            except Exception as e:
+                logger.warning(f"Could not load {name} model: {e}")
+    
+    def _save_models(self, models: Dict[str, Any]):
+        """Save trained models."""
+        for name, model in models.items():
+            with open(f"{self.paths.models_dir}/model_{name}.pkl", 'wb') as f:
+                pickle.dump(model, f)
+            logger.info(f"Saved {name} model")
+    
+    def get_state(self) -> Dict[str, Any]:
+        """Get current pipeline state."""
+        return self.state
+    
+    def stop(self):
+        """Stop Spark and Dask sessions."""
+        if self.spark:
+            self.spark.stop()
+            logger.info("Spark session stopped.")
+        if hasattr(self, 'dask_client') and self.dask_client:
+            self.dask_client.close()
+            logger.info("Dask client closed.")
+
+
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Behavioral Credit Risk Scoring System",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument(
+        '--module', type=str,
+        choices=['ingestion', 'cleaning', 'feature_engineering', 'target_creation',
+                 'dataset_creation', 'tuning', 'training', 'evaluation',
+                 'calibration', 'scoring', 'visualization', 'full'],
+        help='Module to execute'
+    )
+    
+    parser.add_argument('--full', action='store_true', help='Run full pipeline')
+    parser.add_argument('--skip_data', action='store_true', 
+                       help='SKIP ALL data preparation. Use existing data only.')
+    parser.add_argument('--force', action='store_true', 
+                       help='Force re-processing even if data exists')
+    parser.add_argument('--n_trials', type=int, default=30,
+                       help='Number of Optuna trials for hyperparameter tuning')
+    parser.add_argument('--threshold', type=int, choices=[30, 60, 90], default=30,
+                       help='Delinquency threshold for target creation')
+    parser.add_argument('--n_workers', type=int, default=4,
+                       help='Number of Dask workers')
+    parser.add_argument('--threads_per_worker', type=int, default=2,
+                       help='Threads per Dask worker')
+    
+    return parser.parse_args()
+
+
+def main():
+    """Main execution function."""
+    args = parse_arguments()
+    
+    logger.info("=" * 80)
+    logger.info("BEHAVIORAL CREDIT RISK SCORING SYSTEM")
+    logger.info(f"Started at: {datetime.now()}")
+    if args.skip_data:
+        logger.info("*** SKIP DATA MODE ENABLED - Using existing data only ***")
+    logger.info("=" * 80)
+    
+    modules_to_run = []
+    if args.full:
+        modules_to_run = ['full']
+    elif args.module:
+        modules_to_run = [args.module]
+    else:
+        logger.info("No module specified. Use --module or --full")
+        logger.info("Available modules: ingestion, cleaning, feature_engineering, target_creation, dataset_creation, tuning, training, evaluation, calibration, scoring, visualization, full")
+        return
+    
+    pipeline = CreditRiskPipeline(
+        skip_data=args.skip_data,
+        n_workers=args.n_workers,
+        threads_per_worker=args.threads_per_worker
+    )
+    
+    try:
+        for module in modules_to_run:
+            if module == 'full':
+                pipeline.run_module('full')
+            else:
+                kwargs = {}
+                if module == 'tuning':
+                    kwargs['n_trials'] = args.n_trials
+                elif module == 'target_creation':
+                    kwargs['threshold'] = args.threshold
+                elif module in ['ingestion', 'cleaning', 'feature_engineering', 'training']:
+                    kwargs['force'] = args.force
+                elif module == 'dataset_creation':
+                    pass  # No special args needed
+                
+                pipeline.run_module(module, **kwargs)
+        
+        logger.info("=" * 80)
+        logger.info("PIPELINE EXECUTION COMPLETED SUCCESSFULLY")
+        logger.info("=" * 80)
+        
+    except Exception as e:
+        logger.error(f"Pipeline execution failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+    finally:
+        pipeline.stop()
+
+
+if __name__ == "__main__":
+    main()

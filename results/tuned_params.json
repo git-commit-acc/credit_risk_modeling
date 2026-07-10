@@ -1,0 +1,42 @@
+{
+  "logistic": {
+    "C": 0.0024200226408001837,
+    "solver": "newton-cg",
+    "class_weight": null
+  },
+  "random_forest": {
+    "n_estimators": 250,
+    "max_depth": 4,
+    "min_samples_split": 120,
+    "min_samples_leaf": 45,
+    "max_features": null,
+    "class_weight": null
+  },
+  "xgboost": {
+    "n_estimators": 400,
+    "max_depth": 8,
+    "learning_rate": 0.11443003152089135,
+    "subsample": 0.6671834049285933,
+    "colsample_bytree": 0.8259247242146994,
+    "scale_pos_weight": 8.149018551350736,
+    "tree_method": "approx"
+  },
+  "lightgbm": {
+    "n_estimators": 250,
+    "num_leaves": 99,
+    "max_depth": 9,
+    "learning_rate": 0.21214060602402027,
+    "feature_fraction": 0.5659896413977688,
+    "bagging_fraction": 0.9249802704525223,
+    "bagging_freq": 2,
+    "is_unbalance": true
+  },
+  "catboost": {
+    "iterations": 100,
+    "depth": 7,
+    "learning_rate": 0.011784979387549556,
+    "l2_leaf_reg": 4.399422004635733,
+    "border_count": 114,
+    "auto_class_weights": "Balanced"
+  }
+}

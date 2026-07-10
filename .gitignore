@@ -1,0 +1,14 @@
+# Data and models
+data/
+*.pickle
+*.pkl
+*.zip
+catboost_info/
+
+# Logs and caches
+*.log
+__pycache__/
+*.pyc
+
+# IDE settings (optional, but good practice)
+.vscode/
