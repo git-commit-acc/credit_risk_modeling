@@ -1,24 +1,43 @@
 # models/lightgbm_model.py
 """
-LightGBM model for credit risk with Dask support.
+LightGBM model for credit risk with native Dask-distributed training.
+
+FIX 1: same client-lifecycle fix as models/xgboost_model.py -- see that
+module's docstring for details. Reuses the shared client from
+models.dask_utils instead of creating (and leaking) a new LocalCluster on
+every fit() call.
+
+FIX 2 (correctness bug): same root cause as XGBoostModel -- categorical
+columns arrive as raw strings from the Spark feature pipeline, and
+`lightgbm.dask.DaskLGBMClassifier` also rejects object/string dtype columns
+outright. LightGBM's native categorical support requires pandas `category`
+dtype columns (it reads the category codes directly rather than one-hot/
+ordinal encoding them). Categorical columns are now cast via the shared
+`LazyCategoricalEncoder(ordinal_encode=False)` (fit once, lazily,
+partition-wise) before every fit/predict call, and `categorical_feature`
+is passed explicitly so LightGBM's optimal-split categorical algorithm is
+used rather than treating them as numeric.
 """
 
-import pandas as pd
-import numpy as np
+import logging
+from typing import Any, Dict, List, Optional, Union
+
 import dask.dataframe as dd
 import lightgbm as lgb
+import numpy as np
+import pandas as pd
 from lightgbm import dask as lgb_dask
-import logging
-from typing import Dict, Any, Optional, Union
 
 from models.base import BaseCreditRiskModel
+from models.dask_utils import LazyCategoricalEncoder, ensure_dask_dataframe, get_dask_client
 
 logger = logging.getLogger(__name__)
 
 
 class LightGBMModel(BaseCreditRiskModel):
-    """LightGBM Classifier with Dask support."""
-    
+    """LightGBM Classifier with native Dask-distributed training
+    (DaskLGBMClassifier) and native (non-ordinal-encoded) categorical support."""
+
     def __init__(
         self,
         random_state: int = 42,
@@ -32,7 +51,8 @@ class LightGBMModel(BaseCreditRiskModel):
         is_unbalance: bool = True,
         verbosity: int = -1,
         early_stopping_rounds: int = 50,
-        npartitions: int = 4
+        npartitions: int = 8,
+        categorical_columns: Optional[List[str]] = None,
     ):
         super().__init__("LightGBM", random_state)
         self.n_estimators = n_estimators
@@ -46,46 +66,51 @@ class LightGBMModel(BaseCreditRiskModel):
         self.verbosity = verbosity
         self.early_stopping_rounds = early_stopping_rounds
         self.npartitions = npartitions
+        self.categorical_columns = categorical_columns
+        self.cat_typer: Optional[LazyCategoricalEncoder] = None
         self.is_dask_model = True
-        
-        self._client = None
-        
-    def _ensure_dask(self, data: Union[dd.DataFrame, pd.DataFrame]) -> dd.DataFrame:
-        """Convert to Dask if needed."""
-        if isinstance(data, pd.DataFrame):
-            return dd.from_pandas(data, npartitions=self.npartitions)
-        return data
-    
+
+    def _preprocess(self, X: Union[dd.DataFrame, pd.DataFrame], fit: bool) -> dd.DataFrame:
+        """Cast categorical columns to native pandas `category` dtype so
+        LightGBM's own categorical split-finding is used (never a lossy
+        ordinal integer encoding). Lazy/partition-wise; no full compute."""
+        X_dask = ensure_dask_dataframe(X, npartitions=self.npartitions)
+
+        if fit:
+            self.cat_typer = LazyCategoricalEncoder(
+                categorical_columns=self.categorical_columns, ordinal_encode=False
+            )
+            X_typed = self.cat_typer.fit_transform(X_dask)
+            self.categorical_columns = self.cat_typer.categorical_columns
+        else:
+            if self.cat_typer is None:
+                raise ValueError("Model not trained. Call fit() first.")
+            X_typed = self.cat_typer.transform(X_dask)
+
+        return X_typed
+
     def fit(
         self,
         X_train: Union[dd.DataFrame, pd.DataFrame],
         y_train: Union[dd.Series, pd.Series],
         X_val: Optional[Union[dd.DataFrame, pd.DataFrame]] = None,
         y_val: Optional[Union[dd.Series, pd.Series]] = None,
-        **kwargs
+        **kwargs,
     ):
-        """Train LightGBM model with Dask."""
+        """Train LightGBM model with native Dask-distributed training."""
         logger.info(f"Training {self.name} with Dask...")
-        
-        self.feature_names = X_train.columns.tolist()
-        
-        # Convert to Dask
-        X_train_dask = self._ensure_dask(X_train)
-        y_train_dask = self._ensure_dask(y_train) if isinstance(y_train, (pd.Series, dd.Series)) else y_train
-        
-        if X_val is not None:
-            X_val_dask = self._ensure_dask(X_val)
-            y_val_dask = self._ensure_dask(y_val) if isinstance(y_val, (pd.Series, dd.Series)) else y_val
-        
-        # Create Dask client if not exists
-        try:
-            from dask.distributed import Client
-            self._client = Client(n_workers=4, threads_per_worker=2)
-        except:
-            pass
-        
-        # Prepare Dask data
-        dtrain = lgb_dask.DaskLGBMClassifier(
+
+        self.feature_names = list(X_train.columns)
+
+        client = get_dask_client()
+
+        X_train_dask = self._preprocess(X_train, fit=True)
+        y_train_dask = ensure_dask_dataframe(y_train, npartitions=self.npartitions)
+
+        cat_feature_arg = self.categorical_columns if self.categorical_columns else 'auto'
+
+        dask_model = lgb_dask.DaskLGBMClassifier(
+            client=client,
             n_estimators=self.n_estimators,
             num_leaves=self.num_leaves,
             max_depth=self.max_depth,
@@ -95,44 +120,46 @@ class LightGBMModel(BaseCreditRiskModel):
             bagging_freq=self.bagging_freq,
             is_unbalance=self.is_unbalance,
             random_state=self.random_state,
-            verbosity=self.verbosity
+            verbosity=self.verbosity,
         )
-        
-        # Train with validation
-        if X_val is not None:
-            dtrain.fit(
+
+        if X_val is not None and y_val is not None:
+            X_val_dask = self._preprocess(X_val, fit=False)
+            y_val_dask = ensure_dask_dataframe(y_val, npartitions=self.npartitions)
+            # LightGBM >= 4.0 moved early stopping from the `early_stopping_
+            # rounds` fit() kwarg (removed) to an explicit callback.
+            dask_model.fit(
                 X_train_dask, y_train_dask,
                 eval_set=[(X_val_dask, y_val_dask)],
                 eval_metric='logloss',
-                early_stopping_rounds=self.early_stopping_rounds
+                categorical_feature=cat_feature_arg,
+                callbacks=[lgb.early_stopping(self.early_stopping_rounds, verbose=False)],
             )
         else:
-            dtrain.fit(X_train_dask, y_train_dask)
-        
-        self.model = dtrain
-        
-        # Store feature importance
+            dask_model.fit(X_train_dask, y_train_dask, categorical_feature=cat_feature_arg)
+
+        self.model = dask_model
+
         try:
-            importance = dtrain.feature_importances_
-            self.feature_importance = dict(
-                zip(self.feature_names, importance)
-            )
-        except:
-            pass
-        
+            importance = dask_model.feature_importances_
+            self.feature_importance = dict(zip(self.feature_names, importance))
+        except AttributeError as e:
+            logger.warning(f"  Could not extract feature importance: {e}")
+
         logger.info(f"{self.name} training completed.")
         return self
-    
+
     def predict_proba(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict probabilities."""
+        """Predict probabilities. Only the (n_samples, 2) prediction array is
+        computed -- X stays distributed across workers as a Dask array."""
         if self.model is None:
             raise ValueError("Model not trained. Call fit() first.")
-        
-        X_dask = self._ensure_dask(X)
+
+        X_dask = self._preprocess(X, fit=False)
         result = self.model.predict_proba(X_dask)
-        return result.compute()
-    
-    def get_params(self, deep=True):
+        return result.compute() if hasattr(result, "compute") else np.asarray(result)
+
+    def get_params(self, deep: bool = True) -> Dict[str, Any]:
         """Get model parameters for hyperparameter tuning."""
         return {
             'n_estimators': self.n_estimators,
@@ -143,5 +170,5 @@ class LightGBMModel(BaseCreditRiskModel):
             'bagging_fraction': self.bagging_fraction,
             'bagging_freq': self.bagging_freq,
             'is_unbalance': self.is_unbalance,
-            'random_state': self.random_state
+            'random_state': self.random_state,
         }

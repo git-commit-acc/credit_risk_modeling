@@ -30,6 +30,11 @@ from target.target_creation import TargetCreator
 from datasets.dataset_creation import DatasetCreator
 from validation.splitter import DataSplitter
 
+# Shared Dask client + lazy-loading utilities (see models/dask_utils.py) --
+# this is the single client every model module reuses instead of each
+# spinning up its own LocalCluster.
+from models.dask_utils import get_dask_client, close_dask_client
+
 # Import Dask-based models
 from models.logistic import LogisticRegressionModel
 from models.random_forest import RandomForestModel
@@ -98,11 +103,24 @@ class CreditRiskPipeline:
         )
         self.splitter = DataSplitter(self.spark)
         
-        # Initialize Dask client
-        logger.info("Initializing Dask client...")
+        # Initialize Dask client.
+        # FIX: this used to call `Client(...)` directly here, while EVERY
+        # individual model in models/*.py ALSO called `Client(...)` inside
+        # its own fit() -- meaning a run of this pipeline could spin up
+        # 1 (here) + up to 6 (one per base model + ensemble) + many more
+        # (one per hyperparameter-tuning trial) separate local Dask
+        # clusters. Routing through `models.dask_utils.get_dask_client()`
+        # makes this THE single shared client for the whole process; every
+        # model module now reuses it instead of creating its own.
+        logger.info("Initializing shared Dask client...")
         try:
-            self.dask_client = Client(n_workers=n_workers, threads_per_worker=threads_per_worker)
-            logger.info(f"Dask client initialized with {n_workers} workers")
+            self.dask_client = get_dask_client(
+                n_workers=n_workers,
+                threads_per_worker=threads_per_worker,
+                memory_limit=config['dask'].memory_limit,
+            )
+            logger.info(f"Dask client initialized with {n_workers} workers "
+                        f"(dashboard: {self.dask_client.dashboard_link})")
         except Exception as e:
             logger.warning(f"Could not initialize Dask client: {e}. Using single-threaded mode.")
             self.dask_client = None
@@ -155,69 +173,72 @@ class CreditRiskPipeline:
         for d in dirs:
             os.makedirs(d, exist_ok=True)
     
+    # Non-feature columns present in the Spark-written train/val/test parquet
+    # (identifiers + target) that must be excluded from the X feature matrix.
+    _NON_FEATURE_COLUMNS = ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD', 'target']
+
     def _load_existing_data(self) -> bool:
         """
-        Load existing data from parquet as Dask DataFrames.
-        
-        Returns:
-            True if data was loaded successfully, False otherwise.
+        Load existing data as Dask DataFrames directly from the Parquet
+        splits that Spark (datasets/dataset_creation.py -> DataSplitter)
+        already wrote to `config.paths.train_data` / `val_data` / `test_data`.
+
+        FIX: this used to read a *separate*, Dask-specific copy of the data
+        (`dask_X_train.parquet` etc.) that only existed if `_spark_to_dask`
+        had previously run its lossy, row-capped, `.toPandas()`-based
+        conversion (see the removed `_spark_to_dask` method below this one
+        for why that was a problem). Spark already persists the canonical,
+        full-resolution, disk-based Parquet dataset -- there is no reason to
+        duplicate it. `dd.read_parquet` reads it lazily, one Parquet
+        row-group/partition at a time, with column pruning, which is exactly
+        the out-of-core behavior this refactor is meant to guarantee.
         """
-        logger.info("Attempting to load existing data...")
-        
+        logger.info("Loading train/val/test splits as Dask DataFrames "
+                     "(lazy Parquet read, no full-dataset materialization)...")
+
         try:
-            # Load parquet files as Dask DataFrames
-            self.state['X_train'] = dd.read_parquet(f"{self.paths.features_dir}/dask_X_train.parquet")
-            self.state['y_train'] = dd.read_parquet(f"{self.paths.features_dir}/dask_y_train.parquet")
-            self.state['X_test'] = dd.read_parquet(f"{self.paths.features_dir}/dask_X_test.parquet")
-            self.state['y_test'] = dd.read_parquet(f"{self.paths.features_dir}/dask_y_test.parquet")
-            
-            # Load validation data if available
-            if os.path.exists(f"{self.paths.features_dir}/dask_X_val.parquet"):
-                self.state['X_val'] = dd.read_parquet(f"{self.paths.features_dir}/dask_X_val.parquet")
-                self.state['y_val'] = dd.read_parquet(f"{self.paths.features_dir}/dask_y_val.parquet")
-            
-            # Get feature names
-            self.state['feature_names'] = self.state['X_train'].columns.tolist()
-            
+            train_ddf = dd.read_parquet(self.paths.train_data)
+            test_ddf = dd.read_parquet(self.paths.test_data)
+
+            self.state['X_train'], self.state['y_train'] = self._split_features_target(train_ddf)
+            self.state['X_test'], self.state['y_test'] = self._split_features_target(test_ddf)
+
+            if os.path.exists(self.paths.val_data):
+                val_ddf = dd.read_parquet(self.paths.val_data)
+                self.state['X_val'], self.state['y_val'] = self._split_features_target(val_ddf)
+
+            self.state['feature_names'] = list(self.state['X_train'].columns)
             self.state['data_loaded'] = True
-            logger.info(f"Successfully loaded existing data:")
-            logger.info(f"  Train: {self.state['X_train'].shape[0].compute():,} records")
-            logger.info(f"  Test: {self.state['X_test'].shape[0].compute():,} records")
-            if self.state['X_val'] is not None:
-                logger.info(f"  Validation: {self.state['X_val'].shape[0].compute():,} records")
-            
+
+            logger.info("Successfully loaded existing data (Dask, lazy):")
+            logger.info(f"  Train partitions: {self.state['X_train'].npartitions}")
+            logger.info(f"  Test partitions:  {self.state['X_test'].npartitions}")
+            if self.state.get('X_val') is not None:
+                logger.info(f"  Val partitions:   {self.state['X_val'].npartitions}")
+
             return True
-            
+
         except Exception as e:
             logger.warning(f"Could not load existing data: {e}")
             self.state['data_loaded'] = False
             return False
-    
-    def _save_dask_data(self):
-        """Save Dask DataFrames to parquet."""
-        logger.info("Saving Dask DataFrames to parquet...")
-        
-        dask_dir = f"{self.paths.features_dir}"
-        
-        self.state['X_train'].to_parquet(f"{dask_dir}/dask_X_train.parquet", write_index=False)
-        self.state['y_train'].to_parquet(f"{dask_dir}/dask_y_train.parquet", write_index=False)
-        
-        if self.state['X_val'] is not None:
-            self.state['X_val'].to_parquet(f"{dask_dir}/dask_X_val.parquet", write_index=False)
-            self.state['y_val'].to_parquet(f"{dask_dir}/dask_y_val.parquet", write_index=False)
-        
-        self.state['X_test'].to_parquet(f"{dask_dir}/dask_X_test.parquet", write_index=False)
-        self.state['y_test'].to_parquet(f"{dask_dir}/dask_y_test.parquet", write_index=False)
-        
-        logger.info("Dask DataFrames saved successfully")
-    
+
+    def _split_features_target(self, ddf: dd.DataFrame):
+        """Lazily split a combined (features + identifiers + target) Dask
+        DataFrame into X (feature columns only) and y (target Series).
+        Pure column selection -- no compute, no shuffle, no row sampling."""
+        feature_cols = [c for c in ddf.columns if c not in self._NON_FEATURE_COLUMNS]
+        X = ddf[feature_cols]
+        y = ddf['target'].astype('int64')
+        return X, y
+
     def _ensure_data_loaded(self, required_for: str = "modeling"):
         """
         Ensure data is loaded as Dask DataFrames.
         """
         if self.state['data_loaded']:
             return
-        
+
         if self.skip_data:
             if self._load_existing_data():
                 return
@@ -226,75 +247,25 @@ class CreditRiskPipeline:
                     f"Cannot proceed with {required_for}. Data not found and --skip_data is True. "
                     f"Please run data preparation first or remove --skip_data flag."
                 )
-        
-        # Run dataset creation if needed
+
+        # Run dataset creation if needed -- this writes train/val/test
+        # Parquet to disk via Spark (datasets/dataset_creation.py).
         if self.state['train_df'] is None:
             self._run_dataset_creation()
-        
-        # Convert Spark DataFrames to Dask DataFrames
-        self._spark_to_dask()
-    
-    def _spark_to_dask(self):
-        """Convert Spark DataFrames to Dask DataFrames."""
-        logger.info("Converting Spark DataFrames to Dask DataFrames...")
-        
-        # Convert each split to pandas then Dask
-        def spark_to_dask(spark_df, sample_size=0.1):
-            """Convert Spark DataFrame to Dask DataFrame with sampling if needed."""
-            # Sample if too large
-            total_count = spark_df.count()
-            if total_count > 1000000:
-                frac = min(0.2, 1000000 / total_count)
-                spark_df = spark_df.sample(fraction=frac, seed=42)
-            
-            # Convert to pandas
-            pdf = spark_df.toPandas()
-            
-            # Convert to Dask
-            return dd.from_pandas(pdf, npartitions=4)
-        
-        # Convert training data
-        if self.state['train_df'] is not None:
-            # Drop non-feature columns
-            drop_cols = ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD']
-            X_train_df = self.state['train_df'].drop(*[c for c in drop_cols if c in self.state['train_df'].columns])
-            
-            # Separate features and target
-            X_train = spark_to_dask(X_train_df.drop('target'))
-            y_train = spark_to_dask(self.state['train_df'].select('target'))
-            
-            self.state['X_train'] = X_train
-            self.state['y_train'] = y_train['target']
-            self.state['feature_names'] = X_train.columns.tolist()
-        
-        # Convert validation data
-        if self.state['val_df'] is not None:
-            drop_cols = ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD']
-            X_val_df = self.state['val_df'].drop(*[c for c in drop_cols if c in self.state['val_df'].columns])
-            
-            X_val = spark_to_dask(X_val_df.drop('target'))
-            y_val = spark_to_dask(self.state['val_df'].select('target'))
-            
-            self.state['X_val'] = X_val
-            self.state['y_val'] = y_val['target']
-        
-        # Convert test data
-        if self.state['test_df'] is not None:
-            drop_cols = ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD']
-            X_test_df = self.state['test_df'].drop(*[c for c in drop_cols if c in self.state['test_df'].columns])
-            
-            X_test = spark_to_dask(X_test_df.drop('target'))
-            y_test = spark_to_dask(self.state['test_df'].select('target'))
-            
-            self.state['X_test'] = X_test
-            self.state['y_test'] = y_test['target']
-        
-        self.state['data_loaded'] = True
-        
-        # Save Dask data
-        self._save_dask_data()
-        
-        logger.info("Spark to Dask conversion completed")
+
+        # Read the Parquet Spark just wrote back in as lazy Dask
+        # DataFrames. We deliberately re-read from disk here (rather than
+        # trying to hand off Spark's in-memory DataFrame objects directly)
+        # because that's the documented hand-off point in the target
+        # architecture: "Spark ... Save Train/Val/Test as Parquet" ->
+        # "Dask: Read Parquet lazily". It also means `--skip_data` runs
+        # later reuse the exact same code path.
+        if not self._load_existing_data():
+            raise RuntimeError(
+                "Dataset creation completed but the resulting Parquet splits "
+                "could not be read back as Dask DataFrames. Check "
+                f"{self.paths.train_data}, {self.paths.val_data}, {self.paths.test_data}."
+            )
     
     def run_module(self, module: str, **kwargs):
         """
@@ -459,9 +430,16 @@ class CreditRiskPipeline:
         
         dataset_creator = DatasetCreator(self.spark)
         self.state['train_df'], self.state['val_df'], self.state['test_df'] = dataset_creator.create_dataset()
-        
-        # Convert to Dask
-        self._spark_to_dask()
+        # `create_dataset()` already wrote train/val/test to
+        # self.paths.train_data / val_data / test_data via Spark
+        # (datasets/dataset_creation.py::_save_splits). Read that Parquet
+        # back lazily as Dask -- no toPandas, no row sampling, no full
+        # in-memory conversion.
+        if not self._load_existing_data():
+            raise RuntimeError(
+                "Dataset creation completed but the resulting Parquet splits "
+                "could not be read back as Dask DataFrames."
+            )
     
     def _check_bronze_exists(self) -> bool:
         """Check if bronze data already exists."""
@@ -646,17 +624,19 @@ class CreditRiskPipeline:
         
         results = {}
         metrics_calculator = CreditRiskMetrics()
-        
+
+        # y_test never changes across models -- compute it once here rather
+        # than once per model inside the loop below (small label vector,
+        # not the feature matrix, but no reason to redo it per model).
+        y_test_np = self.state['y_test'].compute().values
+
         for name, model in self.state['models'].items():
             logger.info(f"\nEvaluating {name}...")
             
             # Get predictions (returns numpy arrays)
             y_proba = model.predict_proba(self.state['X_test'])[:, 1]
             y_pred = model.predict(self.state['X_test'])
-            
-            # Get y_test as numpy
-            y_test_np = self.state['y_test'].compute().values
-            
+
             # Compute metrics
             metrics = metrics_calculator.evaluate(y_test_np, y_pred, y_proba)
             metrics['name'] = name
@@ -807,10 +787,11 @@ class CreditRiskPipeline:
         visualizer = CreditRiskVisualizer(save_dir=f"{self.paths.results_dir}/plots")
         
         if isinstance(self.state['results'], dict):
+            y_test_np = self.state['y_test'].compute().values
             for name, metrics in self.state['results'].items():
                 if 'feature_importance' in metrics:
                     visualizer.create_model_evaluation_report(
-                        self.state['y_test'].compute().values,
+                        y_test_np,
                         metrics.get('y_proba'),
                         metrics.get('y_pred'),
                         name,
@@ -875,9 +856,11 @@ class CreditRiskPipeline:
         if self.spark:
             self.spark.stop()
             logger.info("Spark session stopped.")
-        if hasattr(self, 'dask_client') and self.dask_client:
-            self.dask_client.close()
-            logger.info("Dask client closed.")
+        # Closes the single shared Dask client/cluster used by this pipeline
+        # AND by every models/*.py module (they all call get_dask_client()
+        # and get back this same instance) -- one clean teardown instead of
+        # each model leaking its own cluster.
+        close_dask_client()
 
 
 def parse_arguments():

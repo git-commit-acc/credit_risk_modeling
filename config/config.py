@@ -240,13 +240,28 @@ class FeatureConfig:
     ])
 
 
+@dataclass
+class DaskConfig:
+    """Configuration for the shared Dask distributed cluster used by every
+    models/*.py module (see models/dask_utils.py::get_dask_client). Centralizing
+    this here means memory_limit in particular -- the main lever for keeping
+    the pipeline within RAM budget on the full 47M-row servicing panel -- is
+    tuned in one place rather than hardcoded inside individual model files."""
+    n_workers: int = 4
+    threads_per_worker: int = 2
+    memory_limit: str = "4GB"
+    npartitions: int = 8
+
+
 # Global configuration instance
 paths = PathConfig()
 model = ModelConfig()
 features = FeatureConfig()
+dask_cfg = DaskConfig()
 
 config = {
     'paths': paths,
     'model': model,
-    'features': features
+    'features': features,
+    'dask': dask_cfg,
 }

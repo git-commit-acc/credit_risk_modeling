@@ -76,10 +76,6 @@ class ProbabilityCalibrator:
         
         self.base_model = model
         
-        # Convert to pandas for sklearn calibration
-        X_train_pd = self._ensure_pandas(X_train)
-        y_train_pd = self._ensure_pandas(y_train)
-        
         # If validation data is provided, use it for calibration
         if X_val is not None and y_val is not None:
             X_val_pd = self._ensure_pandas(X_val)
@@ -104,7 +100,12 @@ class ProbabilityCalibrator:
                 )
                 self.calibrator.fit(y_pred_uncal.reshape(-1, 1), y_val_pd)
         else:
-            # Use cross-validated calibration
+            # Cross-validated calibration is the only branch that needs the
+            # full training set materialized to pandas (CalibratedClassifierCV
+            # is a pure scikit-learn estimator with no Dask-native path) --
+            # so the conversion only happens here, not on every call.
+            X_train_pd = self._ensure_pandas(X_train)
+            y_train_pd = self._ensure_pandas(y_train)
             self.calibrator = CalibratedClassifierCV(
                 model.model,
                 method=self.method,
@@ -128,11 +129,12 @@ class ProbabilityCalibrator:
         if self.calibrator is None:
             raise ValueError("Calibrator not fitted. Call calibrate() first.")
         
-        X_pd = self._ensure_pandas(X)
-        
         if isinstance(self.calibrator, (IsotonicRegression, LogisticRegression)):
-            # Get uncalibrated predictions
-            y_pred_uncal = self.base_model.predict_proba(X_pd)[:, 1]
+            # base_model.predict_proba() already accepts Dask DataFrames
+            # natively (see models/base.py) and only computes the small
+            # (n_samples, 2) prediction array -- X itself is never forced
+            # to pandas here.
+            y_pred_uncal = self.base_model.predict_proba(X)[:, 1]
             
             # Calibrate
             if self.method == 'isotonic':
@@ -143,7 +145,10 @@ class ProbabilityCalibrator:
             # Return as 2-column array for compatibility
             return np.column_stack([1 - y_pred_cal, y_pred_cal])
         else:
-            # CalibratedClassifierCV
+            # CalibratedClassifierCV is pure scikit-learn and has no
+            # Dask-native path, so X is materialized to pandas only in
+            # this branch.
+            X_pd = self._ensure_pandas(X)
             return self.calibrator.predict_proba(X_pd)
     
     def evaluate_calibration(

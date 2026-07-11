@@ -11,3 +11,14 @@ optuna>=3.3.0
 plotly>=5.14.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
+
+# Dask ecosystem -- required by models/*.py and main.py's Spark->Dask
+# hand-off, but was missing from the original requirements.txt entirely.
+dask[dataframe,distributed]>=2024.1.0
+dask-ml>=2024.4.4
+distributed>=2024.1.0
+
+# Parquet engine used by both dd.read_parquet/to_parquet (Dask side) and
+# Spark's parquet reader/writer needs a matching engine available to the
+# Python process for Dask's reads.
+pyarrow>=14.0.0
