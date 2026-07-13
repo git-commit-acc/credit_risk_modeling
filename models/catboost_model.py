@@ -28,39 +28,39 @@ data (this mirrors how XGBoost/LightGBM's Dask integrations also keep a
 single eval set resident) -- the expensive/large object here is TRAIN, which
 this module never fully materializes.
 """
+# models/catboost_model.py
+"""
+CatBoost model for credit risk - uses sklearn API (no Dask distributed).
+CatBoost handles categorical features natively.
+"""
 
-import logging
-from typing import Any, Dict, List, Optional, Union
-
-import dask.dataframe as dd
-import numpy as np
 import pandas as pd
-from catboost import CatBoostClassifier, Pool
+import numpy as np
+import dask.dataframe as dd
+from catboost import CatBoostClassifier
+import logging
+from typing import Dict, Any, Optional, List, Union
 
 from models.base import BaseCreditRiskModel
-from models.dask_utils import ensure_dask_dataframe, identify_categorical_columns
 
 logger = logging.getLogger(__name__)
 
 
 class CatBoostModel(BaseCreditRiskModel):
-    """CatBoost Classifier trained incrementally, partition-by-partition,
-    to bound peak memory usage regardless of total dataset size."""
-
+    """CatBoost Classifier using sklearn API (stable, native categorical support)."""
+    
     def __init__(
         self,
         random_state: int = 42,
-        iterations: int = 300,
+        iterations: int = 100,
         depth: int = 6,
         learning_rate: float = 0.05,
         l2_leaf_reg: float = 3,
         border_count: int = 254,
         auto_class_weights: str = 'Balanced',
         verbose: bool = False,
-        cat_features: Optional[List[str]] = None,
         early_stopping_rounds: int = 50,
-        npartitions: int = 8,
-        rounds_per_partition: Optional[int] = None,
+        cat_features: Optional[List[str]] = None
     ):
         super().__init__("CatBoost", random_state)
         self.iterations = iterations
@@ -70,155 +70,115 @@ class CatBoostModel(BaseCreditRiskModel):
         self.border_count = border_count
         self.auto_class_weights = auto_class_weights
         self.verbose = verbose
-        self.cat_features = cat_features
         self.early_stopping_rounds = early_stopping_rounds
-        self.npartitions = npartitions
-        # Boosting rounds trained per partition pass. Defaults so that one
-        # full pass over all partitions trains `iterations` total rounds.
-        self.rounds_per_partition = rounds_per_partition
-        self.is_dask_model = False  # partition-wise incremental, not Dask-native
-
+        self.cat_features = cat_features
+        self.is_distributed = False
+        self.supports_dask_data = True
+    
+    def _ensure_pandas(self, data):
+        """Convert Dask to pandas if needed."""
+        if isinstance(data, (dd.DataFrame, dd.Series)):
+            return data.compute()
+        return data
+    
     def _identify_categorical_columns(self, X: pd.DataFrame) -> List[str]:
-        cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+        """Identify categorical columns."""
+        cat_cols = []
+        
+        # Columns with object/category dtype
+        cat_cols.extend(X.select_dtypes(include=['object', 'category']).columns.tolist())
+        
+        # Columns with few unique values (likely categorical)
         for col in X.columns:
             if col not in cat_cols:
                 unique_count = X[col].nunique()
                 if unique_count < 20 and X[col].dtype in ['int64', 'float64']:
                     cat_cols.append(col)
+        
         return cat_cols
-
-    def _prep_partition(self, pdf: pd.DataFrame, cat_cols: List[str]) -> pd.DataFrame:
-        pdf = pdf.copy()
-        for col in cat_cols:
-            pdf[col] = pdf[col].fillna('MISSING').astype(str)
-            pdf[col] = pdf[col].replace({'nan': 'MISSING', 'None': 'MISSING'})
-        for col in pdf.columns:
-            if col not in cat_cols:
-                pdf[col] = pdf[col].astype(float)
-        return pdf
-
-    def _make_pool(self, X_pd: pd.DataFrame, y_pd: Optional[pd.Series], cat_cols: List[str]) -> Pool:
-        X_prepped = self._prep_partition(X_pd, cat_cols)
-        y_arr = y_pd.values if y_pd is not None else None
-        return Pool(data=X_prepped, label=y_arr, cat_features=cat_cols)
-
+    
     def fit(
         self,
         X_train: Union[dd.DataFrame, pd.DataFrame],
         y_train: Union[dd.Series, pd.Series],
         X_val: Optional[Union[dd.DataFrame, pd.DataFrame]] = None,
         y_val: Optional[Union[dd.Series, pd.Series]] = None,
-        **kwargs,
+        **kwargs
     ):
-        """Incrementally train CatBoost, one Dask partition at a time."""
-        logger.info(f"Training {self.name} partition-by-partition (out-of-core)...")
-
-        self.feature_names = list(X_train.columns)
-
-        X_dask = ensure_dask_dataframe(X_train, npartitions=self.npartitions)
-        y_dask = ensure_dask_dataframe(y_train, npartitions=self.npartitions)
-        X_dask = X_dask.repartition(npartitions=self.npartitions)
-        y_dask = y_dask.repartition(npartitions=self.npartitions)
-
+        """Train CatBoost model using sklearn API."""
+        logger.info(f"Training {self.name} (sklearn API)...")
+        
+        # Convert to pandas
+        X_train_pd = self._ensure_pandas(X_train)
+        y_train_pd = self._ensure_pandas(y_train)
+        self.feature_names = X_train_pd.columns.tolist()
+        
+        # Identify categorical features if not provided
         if self.cat_features is None:
-            self.cat_features = identify_categorical_columns(X_dask)
+            self.cat_features = self._identify_categorical_columns(X_train_pd)
             logger.info(f"  Identified {len(self.cat_features)} categorical features")
-
-        n_partitions = X_dask.npartitions
-        rounds_per_partition = self.rounds_per_partition or max(1, self.iterations // n_partitions)
-
-        # Validation pool: computed once, held in memory for the duration of
-        # training (small relative to train by construction of the
-        # train/val/test split), used purely for early-stopping/logging.
-        eval_pool = None
+        
+        # Create model using sklearn API
+        self.model = CatBoostClassifier(
+            iterations=self.iterations,
+            depth=self.depth,
+            learning_rate=self.learning_rate,
+            l2_leaf_reg=self.l2_leaf_reg,
+            border_count=self.border_count,
+            auto_class_weights=self.auto_class_weights,
+            random_state=self.random_state,
+            verbose=self.verbose,
+            cat_features=self.cat_features
+        )
+        
+        # Train with validation if provided
         if X_val is not None and y_val is not None:
-            logger.info("  Materializing validation pool for early stopping...")
             X_val_pd = self._ensure_pandas(X_val)
             y_val_pd = self._ensure_pandas(y_val)
-            eval_pool = self._make_pool(X_val_pd, y_val_pd, self.cat_features)
-
-        model = None
-        for part_idx in range(n_partitions):
-            logger.info(f"  Partition {part_idx + 1}/{n_partitions} "
-                        f"({rounds_per_partition} boosting rounds)...")
-
-            X_part = X_dask.get_partition(part_idx).compute()
-            y_part = y_dask.get_partition(part_idx).compute()
-
-            if len(X_part) == 0:
-                continue
-
-            train_pool = self._make_pool(X_part, y_part, self.cat_features)
-
-            # NOTE: CatBoost's `init_model` continuation only accepts a
-            # limited set of changed parameters between calls (e.g. it will
-            # raise if class-weighting parameters differ from the model
-            # being continued). auto_class_weights is therefore only applied
-            # on the very first partition; class imbalance for subsequent
-            # partitions is still reflected because the running model's
-            # tree structure/leaf values already encode it.
-            step_model = CatBoostClassifier(
-                iterations=rounds_per_partition,
-                depth=self.depth,
-                learning_rate=self.learning_rate,
-                l2_leaf_reg=self.l2_leaf_reg,
-                border_count=self.border_count,
-                auto_class_weights=self.auto_class_weights if model is None else None,
-                random_state=self.random_state,
-                verbose=self.verbose,
-                cat_features=self.cat_features,
-                allow_writing_files=False,
+            
+            self.model.fit(
+                X_train_pd, y_train_pd,
+                eval_set=[(X_val_pd, y_val_pd)],
+                early_stopping_rounds=self.early_stopping_rounds,
+                verbose=False
             )
-
-            fit_kwargs = {"verbose": False}
-            if eval_pool is not None:
-                fit_kwargs["eval_set"] = eval_pool
-                # Only apply early stopping on the final partition pass to
-                # avoid truncating training prematurely on an early chunk.
-                if part_idx == n_partitions - 1:
-                    fit_kwargs["early_stopping_rounds"] = self.early_stopping_rounds
-
-            step_model.fit(train_pool, init_model=model, **fit_kwargs)
-            model = step_model
-
-            # `X_part`/`train_pool` go out of scope here and are released
-            # before the next partition is loaded -- peak memory is bounded
-            # by one partition, not the full dataset.
-
-        self.model = model
-
-        if self.model is not None:
-            self.feature_importance = dict(
-                zip(self.feature_names, self.model.feature_importances_)
-            )
-
-        logger.info(f"{self.name} training completed ({n_partitions} partitions).")
+        else:
+            self.model.fit(X_train_pd, y_train_pd, verbose=False)
+        
+        # Store feature importance
+        try:
+            importance = self.model.feature_importances_
+            if self.feature_names:
+                self.feature_importance = dict(
+                    zip(self.feature_names, importance)
+                )
+        except Exception as e:
+            logger.warning(f"Could not get feature importance: {e}")
+        
+        logger.info(f"{self.name} training completed.")
         return self
-
+    
     def predict_proba(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict probabilities. Scoring is done partition-by-partition and
-        concatenated, so this also never materializes the full input at
-        once for large scoring jobs."""
+        """Predict probabilities."""
         if self.model is None:
             raise ValueError("Model not trained. Call fit() first.")
-
-        X_dask = ensure_dask_dataframe(X, npartitions=self.npartitions)
-        preds = []
-        for part_idx in range(X_dask.npartitions):
-            X_part = X_dask.get_partition(part_idx).compute()
-            if len(X_part) == 0:
-                continue
-            pool = self._make_pool(X_part, None, self.cat_features)
-            preds.append(self.model.predict_proba(pool))
-
-        return np.concatenate(preds, axis=0) if preds else np.empty((0, 2))
-
+        
+        X_pd = self._ensure_pandas(X)
+        return self.model.predict_proba(X_pd)
+    
     def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
+        """Predict classes."""
         probs = self.predict_proba(X)
         return (probs[:, 1] >= 0.5).astype(int)
-
-    def get_params(self, deep: bool = True) -> Dict[str, Any]:
-        """Get model parameters for hyperparameter tuning."""
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        """Get feature importance."""
+        if self.feature_importance is not None:
+            return self.feature_importance
+        return {}
+    
+    def get_params(self, deep=True):
+        """Get model parameters."""
         return {
             "random_state": self.random_state,
             "iterations": self.iterations,

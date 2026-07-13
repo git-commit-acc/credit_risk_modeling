@@ -172,6 +172,16 @@ class CreditRiskPipeline:
         ]
         for d in dirs:
             os.makedirs(d, exist_ok=True)
+            
+            # Verify write permission
+            test_file = os.path.join(d, ".write_test")
+            try:
+                with open(test_file, 'w') as f:
+                    f.write('test')
+                os.remove(test_file)
+            except Exception as e:
+                logger.error(f"Cannot write to {d}: {e}")
+                raise
     
     # Non-feature columns present in the Spark-written train/val/test parquet
     # (identifiers + target) that must be excluded from the X feature matrix.
@@ -200,11 +210,19 @@ class CreditRiskPipeline:
             train_ddf = dd.read_parquet(self.paths.train_data)
             test_ddf = dd.read_parquet(self.paths.test_data)
 
+            # FIX: Repartition to a consistent number
+            # Use 64 partitions (good balance for 4 workers)
+            target_partitions = 64
+            train_ddf = train_ddf.repartition(npartitions=target_partitions)
+            test_ddf = test_ddf.repartition(npartitions=target_partitions)
+
             self.state['X_train'], self.state['y_train'] = self._split_features_target(train_ddf)
             self.state['X_test'], self.state['y_test'] = self._split_features_target(test_ddf)
 
             if os.path.exists(self.paths.val_data):
                 val_ddf = dd.read_parquet(self.paths.val_data)
+                # FIX: Repartition to a consistent number
+                val_ddf = val_ddf.repartition(npartitions=target_partitions)
                 self.state['X_val'], self.state['y_val'] = self._split_features_target(val_ddf)
 
             self.state['feature_names'] = list(self.state['X_train'].columns)
@@ -494,7 +512,7 @@ class CreditRiskPipeline:
             try:
                 params = tune_func(self.state['X_train'], self.state['y_train'])
                 tuned_params[name] = params
-                logger.info(f"  ✅ {name} tuning completed")
+                logger.info(f"  === {name} tuning completed")
             except Exception as e:
                 logger.warning(f"Could not tune {name}: {e}")
                 tuned_params[name] = {}
@@ -531,83 +549,113 @@ class CreditRiskPipeline:
                 logger.warning("No tuned parameters found, using defaults")
         
         models = {}
-        
+        failed_models = []  # <-- ADD THIS LINE
+
         # 1. Logistic Regression
         logger.info("\nTraining Logistic Regression with Dask...")
-        lr = LogisticRegressionModel(
-            random_state=self.model_config.random_state,
-            **tuned_params.get('logistic', {})
-        )
-        lr.fit(self.state['X_train'], self.state['y_train'])
-        models['logistic'] = lr
+        try:
+            lr = LogisticRegressionModel(
+                random_state=self.model_config.random_state,
+                **tuned_params.get('logistic', {})
+            )
+            lr.fit(self.state['X_train'], self.state['y_train'])
+            models['logistic'] = lr
+        except Exception as e:
+            logger.warning(f"  ⚠️ Logistic Regression failed: {e}")
+            failed_models.append('logistic')
         
         # 2. Random Forest
         logger.info("\nTraining Random Forest with Dask...")
-        rf = RandomForestModel(
-            random_state=self.model_config.random_state,
-            **tuned_params.get('random_forest', {})
-        )
-        rf.fit(self.state['X_train'], self.state['y_train'])
-        models['random_forest'] = rf
+        try:
+            rf = RandomForestModel(
+                random_state=self.model_config.random_state,
+                **tuned_params.get('random_forest', {})
+            )
+            rf.fit(self.state['X_train'], self.state['y_train'])
+            models['random_forest'] = rf
+        except Exception as e:
+            logger.warning(f"  ⚠️ Random Forest failed: {e}")
+            failed_models.append('random_forest')
         
         # 3. XGBoost
         logger.info("\nTraining XGBoost with Dask...")
-        xgb = XGBoostModel(
-            random_state=self.model_config.random_state,
-            **tuned_params.get('xgboost', {})
-        )
-        xgb.fit(
-            self.state['X_train'], self.state['y_train'],
-            self.state['X_val'], self.state['y_val']
-        )
-        models['xgboost'] = xgb
-        
-        # 4. LightGBM
-        logger.info("\nTraining LightGBM with Dask...")
-        lgb = LightGBMModel(
-            random_state=self.model_config.random_state,
-            **tuned_params.get('lightgbm', {})
-        )
-        lgb.fit(
-            self.state['X_train'], self.state['y_train'],
-            self.state['X_val'], self.state['y_val']
-        )
-        models['lightgbm'] = lgb
-        
-        # 5. CatBoost
-        logger.info("\nTraining CatBoost...")
-        cat = CatBoostModel(
-            random_state=self.model_config.random_state,
-            **tuned_params.get('catboost', {})
-        )
-        cat.fit(
-            self.state['X_train'], self.state['y_train'],
-            self.state['X_val'], self.state['y_val']
-        )
-        models['catboost'] = cat
-        
-        # 6. Ensemble
-        if len(models) >= 2:
-            logger.info("\nTraining Stacking Ensemble with Dask...")
-            ensemble = StackingEnsemble(
-                base_models=list(models.values()),
-                meta_model=LightGBMModel(
-                    random_state=self.model_config.random_state,
-                    is_unbalance=True
-                ),
-                cv_folds=min(3, self.model_config.cv_folds),
-                random_state=self.model_config.random_state
+        try:
+            xgb = XGBoostModel(
+                random_state=self.model_config.random_state,
+                **tuned_params.get('xgboost', {})
             )
-            ensemble.fit(
+            xgb.fit(
                 self.state['X_train'], self.state['y_train'],
                 self.state['X_val'], self.state['y_val']
             )
-            models['ensemble'] = ensemble
+            models['xgboost'] = xgb
+        except Exception as e:
+            logger.warning(f"  ⚠️ XGBoost failed: {e}")
+            failed_models.append('xgboost')
+        
+        # 4. LightGBM
+        logger.info("\nTraining LightGBM with Dask...")
+        try:
+            lgb = LightGBMModel(
+                random_state=self.model_config.random_state,
+                **tuned_params.get('lightgbm', {})
+            )
+            lgb.fit(
+                self.state['X_train'], self.state['y_train'],
+                self.state['X_val'], self.state['y_val']
+            )
+            models['lightgbm'] = lgb
+        except Exception as e:
+            logger.warning(f"  ⚠️ LightGBM failed: {e}")
+            failed_models.append('lightgbm')
+        
+        # 5. CatBoost
+        logger.info("\nTraining CatBoost...")
+        try:
+            cat = CatBoostModel(
+                random_state=self.model_config.random_state,
+                **tuned_params.get('catboost', {})
+            )
+            cat.fit(
+                self.state['X_train'], self.state['y_train'],
+                self.state['X_val'], self.state['y_val']
+            )
+            models['catboost'] = cat
+        except Exception as e:
+            logger.warning(f"  ⚠️ CatBoost failed: {e}")
+            failed_models.append('catboost')
+        
+        # 6. Ensemble (only if at least 2 models succeeded)
+        if len(models) >= 2:
+            logger.info("\nTraining Stacking Ensemble with Dask...")
+            try:
+                ensemble = StackingEnsemble(
+                    base_models=list(models.values()),
+                    meta_model=LightGBMModel(
+                        random_state=self.model_config.random_state,
+                        is_unbalance=True
+                    ),
+                    cv_folds=min(3, self.model_config.cv_folds),
+                    random_state=self.model_config.random_state
+                )
+                ensemble.fit(
+                    self.state['X_train'], self.state['y_train'],
+                    self.state['X_val'], self.state['y_val']
+                )
+                models['ensemble'] = ensemble
+            except Exception as e:
+                logger.warning(f"  ⚠️ Ensemble failed: {e}")
+                failed_models.append('ensemble')
+        else:
+            logger.warning(f"  ⚠️ Not enough models for ensemble (have {len(models)}, need 2)")
         
         self.state['models'] = models
         self._save_models(models)
         
         logger.info(f"Training completed. Models: {list(models.keys())}")
+        if failed_models:
+            logger.warning(f"Failed models: {failed_models}")
+
     
     def _run_evaluation(self, **kwargs):
         """Run model evaluation module with Dask."""
@@ -855,6 +903,7 @@ class CreditRiskPipeline:
         """Stop Spark and Dask sessions."""
         if self.spark:
             self.spark.stop()
+            self.spark = None
             logger.info("Spark session stopped.")
         # Closes the single shared Dask client/cluster used by this pipeline
         # AND by every models/*.py module (they all call get_dask_client()
@@ -862,6 +911,55 @@ class CreditRiskPipeline:
         # each model leaking its own cluster.
         close_dask_client()
 
+    def validate_setup(self):
+        """Validate all paths, permissions, and dependencies before running."""
+        checks = []
+        
+        # Check paths
+        for attr in ['raw_dir', 'bronze_dir', 'silver_dir', 'features_dir', 
+                    'models_dir', 'results_dir']:
+            path = getattr(self.paths, attr)
+            if not os.path.exists(path):
+                checks.append(f"=== Missing directory: {path}")
+            else:
+                checks.append(f"=== Directory exists: {path}")
+        
+        # Check data files if skip_data is True
+        if self.skip_data:
+            for attr in ['train_data', 'val_data', 'test_data']:
+                path = getattr(self.paths, attr)
+                if os.path.exists(path):
+                    checks.append(f"=== Data file exists: {path}")
+                else:
+                    checks.append(f"=== Missing data file: {path}")
+        
+        # Check Spark
+        try:
+            self.spark.version
+            checks.append(f"=== Spark available: {self.spark.version}")
+        except Exception as e:
+            checks.append(f"=== Spark not available: {e}")
+        
+        # Check Dask
+        try:
+            import dask
+            checks.append(f"=== Dask available: {dask.__version__}")
+        except Exception as e:
+            checks.append(f"=== Dask not available: {e}")
+        
+        # Check memory
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            available_gb = memory.available / (1024**3)
+            total_gb = memory.total / (1024**3)
+            checks.append(f"=== Memory: {available_gb:.1f}GB available / {total_gb:.1f}GB total")
+            if available_gb < 4:
+                checks.append(f"=== Low memory available: {available_gb:.1f}GB (recommend > 8GB)")
+        except ImportError:
+            checks.append("=== psutil not installed - skipping memory check")
+        
+        return checks
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -891,6 +989,8 @@ def parse_arguments():
                        help='Number of Dask workers')
     parser.add_argument('--threads_per_worker', type=int, default=2,
                        help='Threads per Dask worker')
+    parser.add_argument('--dry_run', action='store_true', 
+                   help='Validate pipeline setup without executing heavy operations')
     
     return parser.parse_args()
 
@@ -904,8 +1004,95 @@ def main():
     logger.info(f"Started at: {datetime.now()}")
     if args.skip_data:
         logger.info("*** SKIP DATA MODE ENABLED - Using existing data only ***")
+    if args.dry_run:
+        logger.info("*** DRY RUN MODE - Validating setup only ***")
     logger.info("=" * 80)
     
+    # Handle dry run first - no need to initialize full pipeline for basic checks
+    if args.dry_run:
+        logger.info("\n DRY RUN: Validating pipeline setup...")
+        logger.info("-" * 60)
+        
+        # Create pipeline with minimal initialization
+        pipeline = CreditRiskPipeline(
+            skip_data=args.skip_data,
+            n_workers=1,  # Minimal workers for dry run
+            threads_per_worker=1
+        )
+        
+        try:
+            checks = pipeline.validate_setup()
+            logger.info("\nValidation Results:")
+            for check in checks:
+                logger.info(f"  {check}")
+            
+            # Check Python dependencies
+            logger.info("\nChecking Python dependencies...")
+            dependencies = [
+                ('pyspark', 'spark'),
+                ('dask', 'dask'),
+                ('dask_ml', 'dask_ml'),
+                ('xgboost', 'xgboost'),
+                ('lightgbm', 'lightgbm'),
+                ('catboost', 'catboost'),
+                ('optuna', 'optuna'),
+                ('sklearn', 'sklearn'),
+                ('pandas', 'pandas'),
+                ('numpy', 'numpy')
+            ]
+            
+            for module_name, import_name in dependencies:
+                try:
+                    if import_name == 'spark':
+                        # Spark is already checked
+                        continue
+                    __import__(import_name)
+                    logger.info(f"=== {module_name} available")
+                except ImportError:
+                    logger.warning(f"=== {module_name} not found")
+            
+            # Check data files if not skipping data
+            if not args.skip_data:
+                raw_dir = pipeline.paths.raw_dir
+                logger.info(f"\nChecking raw data directory: {raw_dir}")
+                if os.path.exists(raw_dir):
+                    files = os.listdir(raw_dir)
+                    orig_files = [f for f in files if 'orig_' in f]
+                    svcg_files = [f for f in files if 'svcg_' in f]
+                    logger.info(f"  Found {len(orig_files)} origination files")
+                    logger.info(f"  Found {len(svcg_files)} performance files")
+                    
+                    # Check for years 1999-2012
+                    expected_years = list(range(1999, 2013))
+                    found_years = []
+                    for f in orig_files:
+                        try:
+                            year = int(f.split('_')[-1].split('.')[0])
+                            found_years.append(year)
+                        except:
+                            pass
+                    
+                    missing_years = [y for y in expected_years if y not in found_years]
+                    if missing_years:
+                        logger.warning(f"=== Missing origination files for years: {missing_years}")
+                    else:
+                        logger.info(f"=== All origination files present (1999-2012)")
+                else:
+                    logger.warning(f"=== Raw data directory not found: {raw_dir}")
+            
+            logger.info("\n=== DRY RUN COMPLETED - All validations passed")
+            logger.info("-" * 60)
+            return
+            
+        except Exception as e:
+            logger.error(f"\n=== DRY RUN FAILED: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return
+        finally:
+            pipeline.stop()
+    
+    # Normal execution - handle module selection
     modules_to_run = []
     if args.full:
         modules_to_run = ['full']
@@ -914,6 +1101,7 @@ def main():
     else:
         logger.info("No module specified. Use --module or --full")
         logger.info("Available modules: ingestion, cleaning, feature_engineering, target_creation, dataset_creation, tuning, training, evaluation, calibration, scoring, visualization, full")
+        logger.info("Or use --dry_run to validate setup without executing heavy operations")
         return
     
     pipeline = CreditRiskPipeline(
@@ -940,11 +1128,15 @@ def main():
                 pipeline.run_module(module, **kwargs)
         
         logger.info("=" * 80)
-        logger.info("PIPELINE EXECUTION COMPLETED SUCCESSFULLY")
+        logger.info("=== PIPELINE EXECUTION COMPLETED SUCCESSFULLY")
         logger.info("=" * 80)
         
+    except KeyboardInterrupt:
+        logger.warning("=" * 80)
+        logger.warning("=== PIPELINE INTERRUPTED BY USER")
+        logger.warning("=" * 80)
     except Exception as e:
-        logger.error(f"Pipeline execution failed: {e}")
+        logger.error(f"=== Pipeline execution failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
         raise

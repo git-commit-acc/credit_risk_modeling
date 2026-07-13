@@ -26,30 +26,30 @@ partition-wise -- no full-dataset materialization), and
 them with its native (split-search-based) categorical handling rather than
 a lossy hand-rolled integer encoding.
 """
+# models/xgboost_model.py
+"""
+XGBoost model for credit risk - uses sklearn API (no Dask distributed).
+"""
 
-import logging
-from typing import Any, Dict, List, Optional, Union
-
-import dask.dataframe as dd
-import numpy as np
 import pandas as pd
+import numpy as np
+import dask.dataframe as dd
 import xgboost as xgb
-from xgboost import dask as xgb_dask
+import logging
+from typing import Dict, Any, Optional, Union
 
 from models.base import BaseCreditRiskModel
-from models.dask_utils import LazyCategoricalEncoder, ensure_dask_dataframe, get_dask_client
 
 logger = logging.getLogger(__name__)
 
 
 class XGBoostModel(BaseCreditRiskModel):
-    """XGBoost Classifier with native Dask-distributed training (DaskDMatrix)
-    and native (non-ordinal-encoded) categorical support."""
-
+    """XGBoost Classifier using sklearn API (stable)."""
+    
     def __init__(
         self,
         random_state: int = 42,
-        n_estimators: int = 300,
+        n_estimators: int = 100,
         max_depth: int = 6,
         learning_rate: float = 0.05,
         subsample: float = 0.8,
@@ -58,8 +58,7 @@ class XGBoostModel(BaseCreditRiskModel):
         early_stopping_rounds: int = 50,
         tree_method: str = 'hist',
         eval_metric: str = 'logloss',
-        npartitions: int = 8,
-        categorical_columns: Optional[List[str]] = None,
+        n_jobs: int = -1
     ):
         super().__init__("XGBoost", random_state)
         self.n_estimators = n_estimators
@@ -71,115 +70,116 @@ class XGBoostModel(BaseCreditRiskModel):
         self.early_stopping_rounds = early_stopping_rounds
         self.tree_method = tree_method
         self.eval_metric = eval_metric
-        self.npartitions = npartitions
-        self.categorical_columns = categorical_columns
-        self.cat_typer: Optional[LazyCategoricalEncoder] = None
-        self.is_dask_model = True
-
-    def _preprocess(self, X: Union[dd.DataFrame, pd.DataFrame], fit: bool) -> dd.DataFrame:
-        """Cast categorical columns to native pandas `category` dtype
-        (never ordinal-integer-encoded -- see module docstring). Purely
-        numeric columns pass through untouched. Lazy/partition-wise; never
-        triggers a full `.compute()`."""
-        X_dask = ensure_dask_dataframe(X, npartitions=self.npartitions)
-
-        if fit:
-            self.cat_typer = LazyCategoricalEncoder(
-                categorical_columns=self.categorical_columns, ordinal_encode=False
-            )
-            X_typed = self.cat_typer.fit_transform(X_dask)
-            self.categorical_columns = self.cat_typer.categorical_columns
-        else:
-            if self.cat_typer is None:
-                raise ValueError("Model not trained. Call fit() first.")
-            X_typed = self.cat_typer.transform(X_dask)
-
-        return X_typed
-
+        self.n_jobs = n_jobs
+        self.is_distributed = False
+        self.supports_dask_data = True
+        
+    def _ensure_pandas(self, data):
+        """Convert Dask to pandas if needed."""
+        if isinstance(data, (dd.DataFrame, dd.Series)):
+            return data.compute()
+        return data
+    
+    def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Encode categorical columns for XGBoost."""
+        X_encoded = X.copy()
+        
+        for col in X_encoded.columns:
+            if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
+                X_encoded[col] = X_encoded[col].fillna('MISSING')
+                X_encoded[col] = X_encoded[col].astype(str)
+                X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
+                X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
+                # Convert to categorical codes
+                X_encoded[col] = X_encoded[col].astype('category').cat.codes
+        
+        return X_encoded
+    
     def fit(
         self,
         X_train: Union[dd.DataFrame, pd.DataFrame],
         y_train: Union[dd.Series, pd.Series],
         X_val: Optional[Union[dd.DataFrame, pd.DataFrame]] = None,
         y_val: Optional[Union[dd.Series, pd.Series]] = None,
-        **kwargs,
+        **kwargs
     ):
-        """Train XGBoost model with native Dask-distributed training."""
-        logger.info(f"Training {self.name} with Dask...")
-
-        self.feature_names = list(X_train.columns)
-
-        client = get_dask_client()
-
-        X_train_dask = self._preprocess(X_train, fit=True)
-        y_train_dask = ensure_dask_dataframe(y_train, npartitions=self.npartitions)
-
-        dtrain = xgb_dask.DaskDMatrix(client, X_train_dask, y_train_dask, enable_categorical=True)
-
-        evals = [(dtrain, 'train')]
-        early_stopping = None
-        if X_val is not None and y_val is not None:
-            X_val_dask = self._preprocess(X_val, fit=False)
-            y_val_dask = ensure_dask_dataframe(y_val, npartitions=self.npartitions)
-            dval = xgb_dask.DaskDMatrix(client, X_val_dask, y_val_dask, enable_categorical=True)
-            evals = [(dtrain, 'train'), (dval, 'valid')]
-            early_stopping = self.early_stopping_rounds
-
-        params = {
-            'objective': 'binary:logistic',
-            'eval_metric': self.eval_metric,
-            'max_depth': self.max_depth,
-            'learning_rate': self.learning_rate,
-            'subsample': self.subsample,
-            'colsample_bytree': self.colsample_bytree,
-            'scale_pos_weight': self.scale_pos_weight,
-            # 'hist'/'approx' are the only tree methods that support native
-            # categorical splits; anything else would silently ignore
-            # enable_categorical and error out on a category-dtype column.
-            'tree_method': self.tree_method if self.tree_method in ('hist', 'approx') else 'hist',
-            'seed': self.random_state,
-        }
-
-        self.model = xgb_dask.train(
-            client,
-            params,
-            dtrain,
-            num_boost_round=self.n_estimators,
-            evals=evals,
-            early_stopping_rounds=early_stopping,
-            verbose_eval=False,
+        """Train XGBoost model using sklearn API."""
+        logger.info(f"Training {self.name} (sklearn API)...")
+        
+        # Convert to pandas
+        X_train_pd = self._ensure_pandas(X_train)
+        y_train_pd = self._ensure_pandas(y_train)
+        self.feature_names = X_train_pd.columns.tolist()
+        
+        # Encode categorical columns
+        X_train_encoded = self._encode_categorical(X_train_pd)
+        
+        # Create model using sklearn API
+        self.model = xgb.XGBClassifier(
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            learning_rate=self.learning_rate,
+            subsample=self.subsample,
+            colsample_bytree=self.colsample_bytree,
+            scale_pos_weight=self.scale_pos_weight,
+            tree_method=self.tree_method,
+            eval_metric=self.eval_metric,
+            random_state=self.random_state,
+            n_jobs=self.n_jobs,
+            use_label_encoder=False
         )
-
+        
+        # Train with validation if provided
+        if X_val is not None and y_val is not None:
+            X_val_pd = self._ensure_pandas(X_val)
+            y_val_pd = self._ensure_pandas(y_val)
+            X_val_encoded = self._encode_categorical(X_val_pd)
+            
+            self.model.fit(
+                X_train_encoded, y_train_pd,
+                eval_set=[(X_val_encoded, y_val_pd)],
+                early_stopping_rounds=self.early_stopping_rounds,
+                verbose=False
+            )
+        else:
+            self.model.fit(X_train_encoded, y_train_pd, verbose=False)
+        
+        # Store feature importance
         try:
-            importance = self.model['booster'].get_score(importance_type='weight')
-            if importance:
-                self.feature_importance = {
-                    self.feature_names[int(k[1:])] if k.startswith('f') else k: v
-                    for k, v in importance.items()
-                }
-        except (KeyError, IndexError, ValueError) as e:
-            logger.warning(f"  Could not extract feature importance: {e}")
-
+            importance = self.model.feature_importances_
+            if self.feature_names:
+                self.feature_importance = dict(
+                    zip(self.feature_names, importance)
+                )
+        except Exception as e:
+            logger.warning(f"Could not get feature importance: {e}")
+        
         logger.info(f"{self.name} training completed.")
         return self
-
+    
     def predict_proba(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict probabilities. Only the (n_samples,) score array is
-        computed to the client -- X itself stays distributed across workers."""
+        """Predict probabilities."""
         if self.model is None:
             raise ValueError("Model not trained. Call fit() first.")
-
-        client = get_dask_client()
-        X_dask = self._preprocess(X, fit=False)
-        dtest = xgb_dask.DaskDMatrix(client, X_dask, enable_categorical=True)
-
-        preds = xgb_dask.predict(client, self.model, dtest)
-        result = preds.compute()
-
-        return np.column_stack([1 - result, result])
-
-    def get_params(self, deep: bool = True) -> Dict[str, Any]:
-        """Get model parameters for hyperparameter tuning."""
+        
+        X_pd = self._ensure_pandas(X)
+        X_encoded = self._encode_categorical(X_pd)
+        
+        return self.model.predict_proba(X_encoded)
+    
+    def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
+        """Predict classes."""
+        probs = self.predict_proba(X)
+        return (probs[:, 1] >= 0.5).astype(int)
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        """Get feature importance."""
+        if self.feature_importance is not None:
+            return self.feature_importance
+        return {}
+    
+    def get_params(self, deep=True):
+        """Get model parameters."""
         return {
             'n_estimators': self.n_estimators,
             'max_depth': self.max_depth,
@@ -190,4 +190,5 @@ class XGBoostModel(BaseCreditRiskModel):
             'tree_method': self.tree_method,
             'eval_metric': self.eval_metric,
             'random_state': self.random_state,
+            'n_jobs': self.n_jobs
         }

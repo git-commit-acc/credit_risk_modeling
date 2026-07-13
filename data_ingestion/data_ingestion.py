@@ -291,13 +291,90 @@ def get_spark_path(windows_path: str) -> str:
         return f"file:///{normalized}"
 
 
+# def create_spark_session(app_name: str = "SFLLD_DataIngestion") -> SparkSession:
+#     """
+#     Creates a Spark session optimized for Windows 11 local development.
+#     """
+#     os.environ["PYSPARK_PYTHON"] = sys.executable
+#     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+#     # os.environ["HADOOP_HOME"] = r"C:\hadoop"
+#     os.environ["SPARK_LOCAL_IP"] = "127.0.0.1"
+    
+#     # Windows-specific optimizations
+#     os.environ["PYTHONHASHSEED"] = "0"
+
+#     warehouse_dir = r"D:\Projects\credit_risk_scoring\spark-warehouse"
+#     os.makedirs(warehouse_dir, exist_ok=True)
+    
+#     # Clean up any leftover temp files
+#     import shutil
+#     temp_dir = os.path.expanduser("~/AppData/Local/Temp/spark-*")
+#     try:
+#         for d in glob.glob(temp_dir):
+#             if os.path.isdir(d):
+#                 shutil.rmtree(d, ignore_errors=True)
+#     except Exception:
+#         pass
+    
+#     spark = (
+#         SparkSession.builder
+#         .appName(app_name)
+#         .master("local[*]")
+
+#         # Storage
+#         .config("spark.sql.warehouse.dir", get_spark_path(warehouse_dir))
+#         .config("spark.local.dir", r"D:\spark\spark-temp")
+
+#         # Memory
+#         .config("spark.driver.memory", "16g")
+#         .config("spark.executor.memory", "8g")
+#         .config("spark.driver.maxResultSize", "4g")
+
+#         # Shuffle
+#         .config("spark.sql.shuffle.partitions", "128")
+#         .config("spark.default.parallelism", "128")
+
+#         # Adaptive Query Execution
+#         .config("spark.sql.adaptive.enabled", "true")
+#         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+#         .config("spark.sql.adaptive.skewJoin.enabled", "true")
+
+#         # Serialization
+#         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+
+#         # Compression
+#         .config("spark.sql.parquet.compression.codec", "snappy")
+
+#         # Local filesystem
+#         .config("spark.hadoop.fs.defaultFS", "file:///")
+#         .config("spark.hadoop.fs.default.name", "file:///")
+#         .config("spark.hadoop.fs.file.impl",
+#                 "org.apache.hadoop.fs.LocalFileSystem")
+
+#         # Windows
+#         .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+#         .config("spark.sql.execution.arrow.maxRecordsPerBatch", "10000")
+        
+#         # Timeouts to prevent connection issues
+#         .config("spark.network.timeout", "600s")
+#         .config("spark.executor.heartbeatInterval", "60s")
+#         .config("spark.sql.broadcastTimeout", "600")
+
+#         .getOrCreate()
+#     )
+    
+#     conf = spark.sparkContext._jsc.hadoopConfiguration()
+
+#     print("fs.defaultFS =", conf.get("fs.defaultFS"))
+#     print("fs.default.name =", conf.get("fs.default.name"))
+    
+#     spark.sparkContext.setLogLevel("WARN")
+#     logger.info(f"Spark Session created: {spark.version}")
+#     return spark
+
 def create_spark_session(app_name: str = "SFLLD_DataIngestion") -> SparkSession:
-    """
-    Creates a Spark session optimized for Windows 11 local development.
-    """
     os.environ["PYSPARK_PYTHON"] = sys.executable
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-    # os.environ["HADOOP_HOME"] = r"C:\hadoop"
     os.environ["SPARK_LOCAL_IP"] = "127.0.0.1"
     
     warehouse_dir = r"D:\Projects\credit_risk_scoring\spark-warehouse"
@@ -307,54 +384,50 @@ def create_spark_session(app_name: str = "SFLLD_DataIngestion") -> SparkSession:
         SparkSession.builder
         .appName(app_name)
         .master("local[*]")
-
+        
         # Storage
         .config("spark.sql.warehouse.dir", get_spark_path(warehouse_dir))
         .config("spark.local.dir", r"D:\spark\spark-temp")
-
-        # Memory
-        .config("spark.driver.memory", "16g")
-        .config("spark.executor.memory", "8g")
-        .config("spark.driver.maxResultSize", "4g")
-
+        
+        # REDUCED Memory (was 16g driver, 8g executor)
+        .config("spark.driver.memory", "8g")  # Reduced from 16g
+        .config("spark.executor.memory", "4g")  # Reduced from 8g
+        .config("spark.driver.maxResultSize", "2g")  # Reduced from 4g
+        
         # Shuffle
-        .config("spark.sql.shuffle.partitions", "128")
-        .config("spark.default.parallelism", "128")
-
+        .config("spark.sql.shuffle.partitions", "64")  # Reduced from 128
+        .config("spark.default.parallelism", "64")  # Reduced from 128
+        
         # Adaptive Query Execution
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.adaptive.skewJoin.enabled", "true")
-
+        
         # Serialization
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-
+        
         # Compression
         .config("spark.sql.parquet.compression.codec", "snappy")
-
+        
         # Local filesystem
         .config("spark.hadoop.fs.defaultFS", "file:///")
         .config("spark.hadoop.fs.default.name", "file:///")
-        .config("spark.hadoop.fs.file.impl",
-                "org.apache.hadoop.fs.LocalFileSystem")
-
+        .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem")
+        
         # Windows
         .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-        .config("spark.sql.execution.arrow.maxRecordsPerBatch", "10000")
+        .config("spark.sql.execution.arrow.maxRecordsPerBatch", "5000")  # Reduced from 10000
         
-        # Timeouts to prevent connection issues
+        # Timeouts
         .config("spark.network.timeout", "600s")
         .config("spark.executor.heartbeatInterval", "60s")
         .config("spark.sql.broadcastTimeout", "600")
-
+        
+        # ADD THESE TO PREVENT MEMORY ISSUES
+        .config("spark.memory.offHeap.enabled", "true")
+        .config("spark.memory.offHeap.size", "2g")
+        .config("spark.sql.autoBroadcastJoinThreshold", "50m")  # Reduced from default
+        
         .getOrCreate()
     )
     
-    conf = spark.sparkContext._jsc.hadoopConfiguration()
-
-    print("fs.defaultFS =", conf.get("fs.defaultFS"))
-    print("fs.default.name =", conf.get("fs.default.name"))
-    
-    spark.sparkContext.setLogLevel("WARN")
-    logger.info(f"Spark Session created: {spark.version}")
     return spark

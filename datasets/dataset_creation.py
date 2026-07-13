@@ -117,27 +117,52 @@ class DatasetCreator:
         
         return df
     
+    # def _select_model_features(self, df: DataFrame) -> DataFrame:
+    #     """Select features for modeling."""
+    #     # Get all columns except drop features
+    #     drop_features = self.feature_config.drop_features + ['row_num', 'cumulative_delinquency']
+    #     available_cols = df.columns
+        
+    #     # Get static and behavioral features
+    #     feature_cols = (
+    #         self.feature_config.static_features +
+    #         self.feature_config.behavioral_features
+    #     )
+        
+    #     # Only keep features that exist
+    #     feature_cols = [c for c in feature_cols if c in available_cols]
+        
+    #     # Add target and loan identifier
+    #     select_cols = ["LOAN_SEQUENCE_NUMBER", "MONTHLY_REPORTING_PERIOD", "target"] + feature_cols
+    #     select_cols = [c for c in select_cols if c in available_cols and c not in drop_features]
+        
+    #     return df.select(*select_cols)
     def _select_model_features(self, df: DataFrame) -> DataFrame:
-        """Select features for modeling."""
-        # Get all columns except drop features
-        drop_features = self.feature_config.drop_features + ['row_num', 'cumulative_delinquency']
+        """
+        Select features for modeling by excluding drop_features.
+        Keeps LOAN_SEQUENCE_NUMBER, MONTHLY_REPORTING_PERIOD, and target.
+        """
+        # Features to drop (config + additional)
+        drop_features = list(self.feature_config.drop_features)
+        drop_features.extend(['row_num', 'cumulative_delinquency'])
+        
         available_cols = df.columns
         
-        # Get static and behavioral features
-        feature_cols = (
-            self.feature_config.static_features +
-            self.feature_config.behavioral_features
-        )
+        # Always keep these
+        keep_cols = ["LOAN_SEQUENCE_NUMBER", "MONTHLY_REPORTING_PERIOD", "target"]
         
-        # Only keep features that exist
-        feature_cols = [c for c in feature_cols if c in available_cols]
+        # Add all other columns not in drop_features
+        select_cols = keep_cols.copy()
+        for col in available_cols:
+            if col not in drop_features and col not in select_cols:
+                select_cols.append(col)
         
-        # Add target and loan identifier
-        select_cols = ["LOAN_SEQUENCE_NUMBER", "MONTHLY_REPORTING_PERIOD", "target"] + feature_cols
-        select_cols = [c for c in select_cols if c in available_cols and c not in drop_features]
+        # Log what's being kept/dropped
+        logger.info(f"  Selecting {len(select_cols)} columns for modeling")
+        logger.info(f"  Dropping {len([c for c in available_cols if c not in select_cols])} columns")
         
         return df.select(*select_cols)
-    
+
     def _save_splits(self, train_df, val_df, test_df):
         """Save data splits to disk."""
         train_df.write.mode("overwrite").parquet(self.paths.train_data)

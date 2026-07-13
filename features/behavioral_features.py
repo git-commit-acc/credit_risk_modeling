@@ -70,6 +70,20 @@ class BehavioralFeatureEngineer:
         # Create interaction features
         joined_df = self._create_interaction_features(joined_df)
         
+        # logger.info("Feature engineering completed.")
+        # NEW: Drop constant columns after feature creation
+        # logger.info("Checking for constant columns...")
+        # constant_cols = []
+        # for col in joined_df.columns:
+        #     # Sample check for constant columns
+        #     sample = joined_df.select(col).limit(1000).toPandas()
+        #     if sample[col].nunique() <= 1:
+        #         constant_cols.append(col)
+        
+        # if constant_cols:
+        #     logger.info(f"Dropping {len(constant_cols)} constant columns: {constant_cols}")
+        #     joined_df = joined_df.drop(*constant_cols)
+        
         logger.info("Feature engineering completed.")
         return joined_df
     

@@ -27,41 +27,49 @@ class LogisticRegressionModel(BaseCreditRiskModel):
         C: float = 1.0,
         max_iter: int = 1000,
         class_weight: str = 'balanced',
-        solver: str = 'admm',
+        solver: str = 'lbfgs',
         npartitions: int = 8,
     ):
         super().__init__("Logistic Regression", random_state)
         self.C = C
         self.max_iter = max_iter
         self.class_weight = class_weight
-        # dask_ml.linear_model.LogisticRegression is solved with dask-glm
-        # optimizers; 'admm' and 'lbfgs' are supported out-of-core solvers.
-        # sklearn solver names like 'liblinear'/'newton-cg' are NOT valid
-        # here -- silently mapped to 'lbfgs' to stay backward compatible
-        # with configs/tuned_params.json written against the old sklearn-
-        # flavored search space.
         self.solver = solver if solver in ("admm", "lbfgs", "gradient_descent", "proximal_grad") else "lbfgs"
         self.npartitions = npartitions
         self.scaler: Optional[StandardScaler] = None
         self.cat_encoder: Optional[LazyCategoricalEncoder] = None
+        self.constant_cols_: List[str] = []
         self.model = None
         self.is_dask_model = True
 
     def _preprocess(self, X: Union[dd.DataFrame, pd.DataFrame], fit: bool) -> dd.DataFrame:
-        """Lazy categorical encoding + scaling. Never materializes the full
-        feature matrix to pandas -- both the Categorizer/OrdinalEncoder
-        (dask_ml) and StandardScaler (dask_ml) operate partition-wise."""
+        """Lazy categorical encoding + scaling with constant column removal."""
         X_dask = ensure_dask_dataframe(X, npartitions=self.npartitions)
 
         if fit:
             self.cat_encoder = LazyCategoricalEncoder()
             X_encoded = self.cat_encoder.fit_transform(X_dask)
+            
+            # Identify constant columns from a sample
+            logger.info("  Checking for constant columns...")
+            sample = X_encoded.head(1000)
+            self.constant_cols_ = []
+            for col in X_encoded.columns:
+                if col in sample.columns:
+                    # Check if column has only one unique value or all NaN
+                    unique_vals = sample[col].dropna().unique()
+                    if len(unique_vals) <= 1:
+                        self.constant_cols_.append(col)
+            
+            if self.constant_cols_:
+                logger.info(f"  Removing {len(self.constant_cols_)} constant columns: {self.constant_cols_[:5]}...")
+                X_encoded = X_encoded.drop(columns=self.constant_cols_)
         else:
             X_encoded = self.cat_encoder.transform(X_dask)
+            if self.constant_cols_:
+                X_encoded = X_encoded.drop(columns=self.constant_cols_, errors='ignore')
 
-        # Ensure everything is numeric before scaling; any leftover object
-        # columns become NaN -> 0, matching the original semantics without
-        # an eager compute (astype/fillna are lazy, partition-wise ops).
+        # Ensure everything is numeric before scaling
         X_encoded = X_encoded.astype("float64")
         X_encoded = X_encoded.fillna(0.0)
 
@@ -87,8 +95,20 @@ class LogisticRegressionModel(BaseCreditRiskModel):
         self.feature_names = list(X_train.columns)
 
         X_scaled = self._preprocess(X_train, fit=True)
+        # Remove constant columns
+        X_scaled = self._remove_constant_columns(X_scaled)
         y_dask = ensure_dask_dataframe(y_train, npartitions=self.npartitions)
         y_dask = y_dask.astype("int64")
+
+        # Ensure X and y have consistent partitions
+        target_partitions = min(X_scaled.npartitions, y_dask.npartitions)
+        X_scaled = X_scaled.repartition(npartitions=target_partitions)
+        y_dask = y_dask.repartition(npartitions=target_partitions)
+
+        # Update feature names after removing constant columns
+        self.feature_names = [c for c in self.feature_names if c not in self.constant_cols_]
+
+        logger.info(f"  Training with {len(self.feature_names)} features...")
 
         self.model = DaskLogisticRegression(
             C=self.C,
@@ -97,7 +117,12 @@ class LogisticRegressionModel(BaseCreditRiskModel):
             random_state=self.random_state,
             solver=self.solver,
         )
-        self.model.fit(X_scaled.to_dask_array(lengths=True), y_dask.to_dask_array(lengths=True))
+        
+        # Convert to dask arrays with consistent lengths
+        X_array = X_scaled.to_dask_array(lengths=True)
+        y_array = y_dask.to_dask_array(lengths=True)
+        
+        self.model.fit(X_array, y_array)
 
         if hasattr(self.model, "coef_"):
             coef = np.asarray(self.model.coef_)
@@ -109,18 +134,15 @@ class LogisticRegressionModel(BaseCreditRiskModel):
         return self
 
     def predict_proba(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict probabilities. Computes only the (n_samples, 2) output
-        array, never the input feature matrix."""
+        """Predict probabilities."""
         if self.model is None:
             raise ValueError("Model not trained. Call fit() first.")
 
         X_scaled = self._preprocess(X, fit=False)
-        proba = self.model.predict_proba(X_scaled.to_dask_array(lengths=True))
+        X_array = X_scaled.to_dask_array(lengths=True)
+        proba = self.model.predict_proba(X_array)
         proba = np.asarray(proba.compute()) if hasattr(proba, "compute") else np.asarray(proba)
 
-        # dask_ml's GLM-based LogisticRegression.predict_proba already
-        # returns shape (n_samples, 2); guard for older/edge-case builds
-        # that return the positive-class probability as a 1-D vector.
         if proba.ndim == 1:
             return np.column_stack([1 - proba, proba])
         return proba
@@ -150,3 +172,25 @@ class LogisticRegressionModel(BaseCreditRiskModel):
             'solver': self.solver,
             'random_state': self.random_state,
         }
+    # models/logistic.py - Add this method to handle constant columns
+
+    def _remove_constant_columns(self, X: dd.DataFrame, threshold: float = 0.999) -> dd.DataFrame:
+        """
+        Remove columns that are constant or near-constant.
+        Uses Dask's variance computation (lazy, no full materialization).
+        """
+        # Compute variance for each column (lazy operation)
+        variances = X.var().compute()
+        
+        # Find columns with zero or near-zero variance
+        constant_cols = []
+        for col, var in variances.items():
+            if var == 0 or var < 1e-10:
+                constant_cols.append(col)
+                logger.info(f"  Removing constant column: {col} (variance={var})")
+        
+        if constant_cols:
+            X = X.drop(columns=constant_cols)
+            logger.info(f"  Removed {len(constant_cols)} constant columns")
+        
+        return X

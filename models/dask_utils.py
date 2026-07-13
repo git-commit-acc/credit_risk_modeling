@@ -6,7 +6,7 @@ This module exists to fix two systemic problems found across the original
 models/*.py files:
 
   1. EVERY model (logistic, random_forest, xgboost, lightgbm) created its own
-     `dask.distributed.Client(n_workers=4, threads_per_worker=2)` inside
+     `dask.distributed.Client(n_workers=3, threads_per_worker=4)` inside
      `fit()`, wrapped in a bare `try/except: pass`. Calling `Client()` when a
      client/cluster is already running either raises, silently connects to
      the wrong scheduler, or (most commonly here, since exceptions were
@@ -38,6 +38,9 @@ models/*.py files:
      `LabelEncoder` loops handled ad hoc and inconsistently.
 """
 
+import tempfile
+import time
+import os
 import logging
 import threading
 from typing import List, Optional, Union
@@ -53,59 +56,254 @@ _client_lock = threading.Lock()
 _client: Optional[Client] = None
 
 
+os.environ["MALLOC_TRIM_THRESHOLD_"] = "65536"  # Low value encourages trimming
+
+logger = logging.getLogger(__name__)
+
+# Global client instance
+_shared_client: Optional[Client] = None
+_shared_cluster: Optional[LocalCluster] = None
+
+
+def trim_dask_workers_memory(client: Client) -> int:
+    """
+    Manually trim memory on all Dask workers (Linux only).
+
+    This function runs malloc_trim on each worker, which forces the glibc
+    memory allocator to release freed memory back to the OS.
+
+    Args:
+        client: The Dask client connected to the workers.
+
+    Returns:
+        The number of bytes released.
+    """
+    try:
+        import ctypes
+
+        def trim_memory() -> int:
+            """Call malloc_trim to release memory back to the OS."""
+            try:
+                libc = ctypes.CDLL("libc.so.6")
+                return libc.malloc_trim(0)
+            except OSError:
+                return 0
+
+        results = client.run(trim_memory)
+        total_freed = sum(results.values())
+        logger.info(f"Manually trimmed memory on workers: freed {total_freed / 1024 / 1024:.2f} MB")
+        return total_freed
+    except Exception as e:
+        logger.warning(f"Could not manually trim worker memory: {e}")
+        return 0
+
+
+# def get_dask_client(
+#     n_workers: int = 4,
+#     threads_per_worker: int = 2,
+#     memory_limit: str = "5GB",
+#     dashboard_address: Optional[str] = None,
+# ) -> Client:
+#     """
+#     Return the process-wide Dask distributed Client, creating it on first
+#     call. Every model module should call this instead of constructing its
+#     own Client -- this is what makes it safe for main.py to train five base
+#     models, a meta-learner, and run hyperparameter tuning without spawning a
+#     new local cluster on every `fit()` call.
+#     """
+#     global _client
+#     with _client_lock:
+#         if _client is not None:
+#             try:
+#                 # Cheap liveness check; if the scheduler died, fall through
+#                 # and recreate rather than handing back a dead client.
+#                 if _client.status == "running":
+#                     # Test with a lightweight operation
+#                     _client.run(lambda: 1)  # Quick heartbeat check
+#                     return _client
+#             except Exception:
+#                 pass
+#          # Use a stable temp directory for Windows
+#         temp_dir = os.path.join(tempfile.gettempdir(), "dask_credit_risk")
+#         os.makedirs(temp_dir, exist_ok=True)
+
+#         logger.info(
+#             f"Starting shared Dask LocalCluster "
+#             f"(workers={n_workers}, threads_per_worker={threads_per_worker}, "
+#             f"memory_limit={memory_limit})..."
+#         )
+#         cluster = LocalCluster(
+#             n_workers=n_workers,
+#             threads_per_worker=threads_per_worker,
+#             memory_limit=memory_limit,
+#             dashboard_address=dashboard_address,
+#             processes=True,
+#             # Add Windows-specific settings
+#             local_directory=temp_dir,
+#             # Shutdown timeout to allow proper cleanup
+#             death_timeout=30,
+#         )
+#         _client = Client(cluster)
+#         logger.info(f"Dask dashboard: {_client.dashboard_link}")
+#         return _client
+
 def get_dask_client(
-    n_workers: int = 4,
-    threads_per_worker: int = 2,
+    n_workers: int = 2,
+    threads_per_worker: int = 1,
     memory_limit: str = "4GB",
-    dashboard_address: Optional[str] = None,
+    dashboard_address: str = ":8787",
+    local_directory: Optional[str] = None
 ) -> Client:
     """
-    Return the process-wide Dask distributed Client, creating it on first
-    call. Every model module should call this instead of constructing its
-    own Client -- this is what makes it safe for main.py to train five base
-    models, a meta-learner, and run hyperparameter tuning without spawning a
-    new local cluster on every `fit()` call.
-    """
-    global _client
-    with _client_lock:
-        if _client is not None:
-            try:
-                # Cheap liveness check; if the scheduler died, fall through
-                # and recreate rather than handing back a dead client.
-                if _client.status == "running":
-                    return _client
-            except Exception:
-                pass
+    Get or create a shared Dask client.
 
-        logger.info(
-            f"Starting shared Dask LocalCluster "
-            f"(workers={n_workers}, threads_per_worker={threads_per_worker}, "
-            f"memory_limit={memory_limit})..."
-        )
-        cluster = LocalCluster(
+    Args:
+        n_workers: Number of Dask workers
+        threads_per_worker: Threads per worker
+        memory_limit: Memory limit per worker
+        dashboard_address: Dashboard address
+        local_directory: Directory for worker spilling
+
+    Returns:
+        Dask Client instance
+    """
+    global _shared_client, _shared_cluster
+
+    if _shared_client is not None and _shared_client.status == 'running':
+        logger.info("Reusing existing Dask client")
+        return _shared_client
+
+    # Clean up old temp directories
+    _cleanup_dask_temp()
+
+    # Create a clean temp directory for this session
+    if local_directory is None:
+        temp_dir = os.path.join(tempfile.gettempdir(), "dask_scratch_space")
+        local_directory = temp_dir
+
+    os.makedirs(local_directory, exist_ok=True)
+
+    logger.info(f"Creating Dask client with {n_workers} workers...")
+
+    try:
+        # Create cluster with Windows-friendly settings
+        _shared_cluster = LocalCluster(
             n_workers=n_workers,
             threads_per_worker=threads_per_worker,
             memory_limit=memory_limit,
             dashboard_address=dashboard_address,
-            processes=True,
+            local_directory=local_directory,
+            silence_logs=logging.ERROR,
+            death_timeout=60,
+            # Use 'managed' memory measure to avoid overreaction to unmanaged memory
+            memory_target_fraction=0.6,  # Start spilling at 60% of managed memory
+            memory_spill_fraction=0.7,   # More aggressive spilling at 70% of process memory
+            memory_pause_fraction=0.8,   # Pause at 80% of process memory
+            memory_terminate_fraction=0.95  # Terminate at 95% of process memory
         )
-        _client = Client(cluster)
-        logger.info(f"Dask dashboard: {_client.dashboard_link}")
-        return _client
+
+        _shared_client = Client(_shared_cluster)
+        logger.info(f"Dask client created: {_shared_client.dashboard_link}")
+
+        # --- Attempt to trim memory after some tasks ---
+        # This is a proactive measure. You can also call this function
+        # later in your pipeline if needed.
+        # trim_dask_workers_memory(_shared_client)
+
+        return _shared_client
+
+    except Exception as e:
+        logger.warning(f"Failed to create Dask cluster: {e}")
+        # Fallback: Single-threaded mode
+        logger.info("Falling back to single-threaded mode...")
+        _shared_client = Client(processes=False, threads_per_worker=1)
+        return _shared_client
 
 
-def close_dask_client() -> None:
-    """Shut down the shared client/cluster. Call once at pipeline teardown."""
-    global _client
-    with _client_lock:
-        if _client is not None:
-            try:
-                _client.close()
-                logger.info("Shared Dask client closed.")
-            except Exception as e:
-                logger.warning(f"Error closing Dask client: {e}")
-            finally:
-                _client = None
+
+# def close_dask_client() -> None:
+#     """Shut down the shared client/cluster. Call once at pipeline teardown."""
+#     global _client
+#     with _client_lock:
+#         if _client is not None:
+#             try:
+#                 _client.close()
+#                 logger.info("Shared Dask client closed.")
+#             except Exception as e:
+#                 logger.warning(f"Error closing Dask client: {e}")
+#             finally:
+#                 _client = None
+
+# def close_dask_client() -> None:
+#     """Shut down the shared client/cluster with Windows-friendly cleanup."""
+#     global _client
+#     with _client_lock:
+#         if _client is not None:
+#             try:
+#                 # Graceful shutdown - give workers time to clean up
+#                 _client.shutdown()
+#                 _client.close()
+#                 logger.info("Shared Dask client closed gracefully.")
+#             except Exception as e:
+#                 logger.warning(f"Error closing Dask client: {e}")
+#             finally:
+#                 _client = None
+    
+#     # Additional Windows temp cleanup
+#     import shutil
+#     import tempfile
+#     try:
+#         temp_dir = os.path.join(tempfile.gettempdir(), "dask-scratch-space")
+#         if os.path.exists(temp_dir):
+#             # Only remove if it's empty or old
+#             for item in os.listdir(temp_dir):
+#                 item_path = os.path.join(temp_dir, item)
+#                 try:
+#                     if os.path.isdir(item_path):
+#                         # Check if it's a dask worker directory
+#                         if item.startswith("worker-") or item.startswith("scheduler-"):
+#                             # Check if the directory is empty before removing
+#                             if not os.listdir(item_path):
+#                                 os.rmdir(item_path)
+#                 except Exception:
+#                     pass
+#     except Exception:
+#         pass
+
+def close_dask_client():
+    """Close the shared Dask client and cluster."""
+    global _shared_client, _shared_cluster
+
+    if _shared_client is not None:
+        try:
+            _shared_client.close()
+            logger.info("Dask client closed")
+        except Exception as e:
+            logger.warning(f"Error closing Dask client: {e}")
+        _shared_client = None
+
+    if _shared_cluster is not None:
+        try:
+            _shared_cluster.close()
+            logger.info("Dask cluster closed")
+        except Exception as e:
+            logger.warning(f"Error closing Dask cluster: {e}")
+        _shared_cluster = None
+
+    # Clean up temp directories
+    _cleanup_dask_temp()
+
+
+def _cleanup_dask_temp():
+    """Clean up Dask temporary directories."""
+    temp_dir = os.path.join(tempfile.gettempdir(), "dask-scratch-space")
+    try:
+        if os.path.exists(temp_dir):
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.debug(f"Cleaned up {temp_dir}")
+    except Exception:
+        pass
 
 
 def ensure_dask_dataframe(
@@ -164,6 +362,17 @@ def identify_categorical_columns(
 
     return dtype_cat_cols + low_card_cols
 
+def with_retry(func, max_retries=3, delay=5):
+    """Retry a function with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay}s...")
+            time.sleep(delay)
+            delay *= 2
 
 class LazyCategoricalEncoder:
     """
