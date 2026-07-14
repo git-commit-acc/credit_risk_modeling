@@ -67,7 +67,7 @@ class PathConfig:
 class ModelConfig:
     """Configuration for model parameters."""
     # Target definition
-    default_threshold: int = 30  # 30+ DPD
+    default_threshold: int = 90  # 30+ DPD
     lookahead_months: int = 12
     
     # Data split

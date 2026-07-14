@@ -75,28 +75,50 @@ class LightGBMModel(BaseCreditRiskModel):
             return data.compute()
         return data
     
+    # def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
+    #     """Encode categorical columns for LightGBM."""
+    #     X_encoded = X.copy()
+        
+    #     for col in X_encoded.columns:
+    #         if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
+    #             X_encoded[col] = X_encoded[col].fillna('MISSING')
+    #             X_encoded[col] = X_encoded[col].astype(str)
+    #             X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
+    #             X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
+    #             # Convert to categorical codes
+    #             X_encoded[col] = X_encoded[col].astype('category').cat.codes
+        
+    #     return X_encoded
     def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
         """Encode categorical columns for LightGBM."""
         X_encoded = X.copy()
         
         for col in X_encoded.columns:
-            if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
+            # Use pandas API to detect ALL string-like types
+            if pd.api.types.is_object_dtype(X_encoded[col]) or \
+            pd.api.types.is_string_dtype(X_encoded[col]) or \
+            pd.api.types.is_categorical_dtype(X_encoded[col]):
+                
                 X_encoded[col] = X_encoded[col].fillna('MISSING')
                 X_encoded[col] = X_encoded[col].astype(str)
                 X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
                 X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
-                # Convert to categorical codes
-                X_encoded[col] = X_encoded[col].astype('category').cat.codes
+                X_encoded[col] = X_encoded[col].replace('', 'MISSING')
+                
+                if X_encoded[col].nunique() <= 1:
+                    X_encoded[col] = 0
+                else:
+                    X_encoded[col] = X_encoded[col].astype('category').cat.codes
         
         return X_encoded
     
     def fit(
-        self,
-        X_train: Union[dd.DataFrame, pd.DataFrame],
-        y_train: Union[dd.Series, pd.Series],
-        X_val: Optional[Union[dd.DataFrame, pd.DataFrame]] = None,
-        y_val: Optional[Union[dd.Series, pd.Series]] = None,
-        **kwargs
+    self,
+    X_train: Union[dd.DataFrame, pd.DataFrame],
+    y_train: Union[dd.Series, pd.Series],
+    X_val: Optional[Union[dd.DataFrame, pd.DataFrame]] = None,
+    y_val: Optional[Union[dd.Series, pd.Series]] = None,
+    **kwargs
     ):
         """Train LightGBM model using sklearn API."""
         logger.info(f"Training {self.name} (sklearn API)...")
@@ -109,7 +131,7 @@ class LightGBMModel(BaseCreditRiskModel):
         # Encode categorical columns
         X_train_encoded = self._encode_categorical(X_train_pd)
         
-        # Create model using sklearn API (no Dask)
+        # Create model - verbosity controls output
         self.model = lgb.LGBMClassifier(
             n_estimators=self.n_estimators,
             num_leaves=self.num_leaves,
@@ -120,7 +142,7 @@ class LightGBMModel(BaseCreditRiskModel):
             bagging_freq=self.bagging_freq,
             is_unbalance=self.is_unbalance,
             random_state=self.random_state,
-            verbosity=self.verbosity,
+            verbosity=-1,  # -1 = silent, 0 = warning, 1 = info
             n_jobs=self.n_jobs
         )
         
@@ -134,12 +156,12 @@ class LightGBMModel(BaseCreditRiskModel):
                 X_train_encoded, y_train_pd,
                 eval_set=[(X_val_encoded, y_val_pd)],
                 eval_metric='logloss',
-                callbacks=[lgb.early_stopping(self.early_stopping_rounds)],
-                verbose=False
+                callbacks=[lgb.early_stopping(self.early_stopping_rounds)]
+                # FIX: removed 'verbose' from here - use verbosity in constructor
             )
         else:
-            self.model.fit(X_train_encoded, y_train_pd, verbose=False)
-        
+            self.model.fit(X_train_encoded, y_train_pd)
+            
         # Store feature importance
         try:
             importance = self.model.feature_importances_

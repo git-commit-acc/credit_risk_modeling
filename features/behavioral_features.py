@@ -10,6 +10,7 @@ from pyspark.sql.functions import (
     months_between, lit, ceil, sin, cos, pow, sqrt, abs,
     expr, coalesce, to_date, datediff
 )
+from pyspark.sql.types import DoubleType, StringType, IntegerType
 from pyspark.sql.window import Window
 import logging
 from collections import Counter
@@ -25,9 +26,9 @@ class BehavioralFeatureEngineer:
         self.spark = spark
     
     def create_all_features(
-        self,
-        origination_df: DataFrame,
-        performance_df: DataFrame
+    self,
+    origination_df: DataFrame,
+    performance_df: DataFrame
     ) -> DataFrame:
         """Create all behavioral features."""
         logger.info("Starting behavioral feature engineering...")
@@ -35,25 +36,18 @@ class BehavioralFeatureEngineer:
         origination_df = origination_df.drop("ingestion_timestamp")
         performance_df = performance_df.drop("ingestion_timestamp", "vintage_year")
 
-        # logger.info(f"Originations columns: {origination_df.columns}")
-        # logger.info(f"Performance columns: {performance_df.columns}")
-
         # Join performance with origination
         joined_df = performance_df.join(
             origination_df,
             on="LOAN_SEQUENCE_NUMBER",
             how="inner"
         )
-
-        # cols = joined_df.columns
-        # duplicates = [c for c, n in Counter(cols).items() if n > 1]
-        # print("Duplicate columns:", duplicates)
         
         # Create time features
         joined_df = self._create_time_features(joined_df)
         
         # Create delinquency behavior features
-        joined_df = self._create_delinquency_features(joined_df)
+        joined_df = self._create_delinquency_features(joined_df)  # Uses encoded column
         
         # Create balance behavior features
         joined_df = self._create_balance_features(joined_df)
@@ -70,20 +64,16 @@ class BehavioralFeatureEngineer:
         # Create interaction features
         joined_df = self._create_interaction_features(joined_df)
         
-        # logger.info("Feature engineering completed.")
-        # NEW: Drop constant columns after feature creation
-        # logger.info("Checking for constant columns...")
-        # constant_cols = []
-        # for col in joined_df.columns:
-        #     # Sample check for constant columns
-        #     sample = joined_df.select(col).limit(1000).toPandas()
-        #     if sample[col].nunique() <= 1:
-        #         constant_cols.append(col)
-        
-        # if constant_cols:
-        #     logger.info(f"Dropping {len(constant_cols)} constant columns: {constant_cols}")
-        #     joined_df = joined_df.drop(*constant_cols)
-        
+        # FIX: Ensure ALL columns are numeric before saving
+        logger.info("Ensuring all columns are numeric...")
+        for col_name in joined_df.columns:
+            if col_name in ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD']:
+                continue
+            # Check if column is string type
+            if str(joined_df.schema[col_name].dataType) in ['StringType', 'StringType()']:
+                # FIX: Use col() function, not string.cast()
+                joined_df = joined_df.withColumn(col_name, col(col_name).cast(DoubleType()))
+                
         logger.info("Feature engineering completed.")
         return joined_df
     
@@ -133,7 +123,12 @@ class BehavioralFeatureEngineer:
         return df
     
     def _create_delinquency_features(self, df: DataFrame) -> DataFrame:
-        """Create delinquency behavior features."""
+        """
+        Create delinquency behavior features.
+        
+        NOTE: CURRENT_LOAN_DELINQUENCY_STATUS is already encoded to numeric
+        in cleaning.py (0-9, with RA=10). We use the encoded version directly.
+        """
         logger.info("Creating delinquency features...")
         
         # Define Window specifications
@@ -142,21 +137,18 @@ class BehavioralFeatureEngineer:
         window_6m = Window.partitionBy("LOAN_SEQUENCE_NUMBER").orderBy("MONTHLY_REPORTING_PERIOD").rowsBetween(-6, -1)
         window_12m = Window.partitionBy("LOAN_SEQUENCE_NUMBER").orderBy("MONTHLY_REPORTING_PERIOD").rowsBetween(-12, -1)
         
-        # Parse delinquency status to numeric
+        # CRITICAL FIX: Use the already-encoded column from cleaning.py
+        # CURRENT_LOAN_DELINQUENCY_STATUS is already numeric (0-10)
+        # Just rename it to delinquency_numeric for clarity in feature engineering
         df = df.withColumn(
             "delinquency_numeric",
-            when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "0", 0)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "1", 1)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "2", 2)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "3", 3)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "4", 4)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "5", 5)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "6", 6)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "7", 7)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "8", 8)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "9", 9)
-            .when(col("CURRENT_LOAN_DELINQUENCY_STATUS") == "RA", 10)
-            .otherwise(0).cast("int")
+            col("CURRENT_LOAN_DELINQUENCY_STATUS").cast("int")
+        )
+        
+        # Fill nulls with 0 for calculations
+        df = df.withColumn(
+            "delinquency_numeric",
+            coalesce(col("delinquency_numeric"), lit(0))
         )
         
         # Rolling max delinquency
@@ -252,6 +244,40 @@ class BehavioralFeatureEngineer:
         )
         
         return df
+
+
+# # Add to behavioral_features.py - replace the delinquency parsing section
+#  No longer needed as we are using the already-encoded CURRENT_LOAN_DELINQUENCY_STATUS from cleaning.py
+
+#     def _parse_delinquency_status(self, df: DataFrame) -> DataFrame:
+#         """
+#         Parse delinquency status to numeric using Data Dictionary mapping.
+        
+#         Valid values: 0-9 (0=Current, 1=30 days, ..., 9=270+ days)
+#         RA = REO Acquisition
+#         Invalid values → NULL
+#         """
+#         # Use the same mapping from cleaning.py
+#         from preprocessing.cleaning import DELINQUENCY_STATUS_NUMERIC
+        
+#         # Build when-otherwise expression
+#         when_expr = None
+#         for status, code in DELINQUENCY_STATUS_NUMERIC.items():
+#             condition = col("CURRENT_LOAN_DELINQUENCY_STATUS") == lit(status)
+#             if when_expr is None:
+#                 when_expr = when(condition, lit(code))
+#             else:
+#                 when_expr = when_expr.when(condition, lit(code))
+        
+#         if when_expr is not None:
+#             df = df.withColumn(
+#                 "delinquency_numeric",
+#                 when_expr.otherwise(lit(None))
+#             )
+#         else:
+#             df = df.withColumn("delinquency_numeric", lit(None))
+        
+#         return df
     
     def _create_balance_features(self, df: DataFrame) -> DataFrame:
         """Create balance behavior features."""

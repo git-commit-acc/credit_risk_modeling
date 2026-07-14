@@ -75,7 +75,8 @@ class CreditRiskPipeline:
         spark: Optional[SparkSession] = None, 
         skip_data: bool = False,
         n_workers: int = 4,
-        threads_per_worker: int = 2
+        threads_per_worker: int = 2,
+        test_mode: bool = False 
     ):
         """
         Initialize the pipeline.
@@ -85,12 +86,14 @@ class CreditRiskPipeline:
             skip_data: If True, skip all data preparation and use existing data.
             n_workers: Number of Dask workers
             threads_per_worker: Threads per Dask worker
+            test_mode: If True, run in test mode with limited data
         """
         self.spark = spark or create_spark_session()
         self.paths = config['paths']
         self.model_config = config['model']
         self.feature_config = config['features']
         self.skip_data = skip_data
+        self.test_mode = test_mode 
         
         # Initialize Spark components
         self.ingestor = SFLLDDataIngestion(self.spark)
@@ -190,28 +193,23 @@ class CreditRiskPipeline:
     def _load_existing_data(self) -> bool:
         """
         Load existing data as Dask DataFrames directly from the Parquet
-        splits that Spark (datasets/dataset_creation.py -> DataSplitter)
-        already wrote to `config.paths.train_data` / `val_data` / `test_data`.
-
-        FIX: this used to read a *separate*, Dask-specific copy of the data
-        (`dask_X_train.parquet` etc.) that only existed if `_spark_to_dask`
-        had previously run its lossy, row-capped, `.toPandas()`-based
-        conversion (see the removed `_spark_to_dask` method below this one
-        for why that was a problem). Spark already persists the canonical,
-        full-resolution, disk-based Parquet dataset -- there is no reason to
-        duplicate it. `dd.read_parquet` reads it lazily, one Parquet
-        row-group/partition at a time, with column pruning, which is exactly
-        the out-of-core behavior this refactor is meant to guarantee.
+        splits that Spark already wrote to disk.
         """
         logger.info("Loading train/val/test splits as Dask DataFrames "
-                     "(lazy Parquet read, no full-dataset materialization)...")
+                    "(lazy Parquet read, no full-dataset materialization)...")
 
         try:
             train_ddf = dd.read_parquet(self.paths.train_data)
             test_ddf = dd.read_parquet(self.paths.test_data)
 
-            # FIX: Repartition to a consistent number
-            # Use 64 partitions (good balance for 4 workers)
+            # NEW: Apply test sampling if test_mode is enabled
+            if self.test_mode:
+                sample_frac = 0.1
+                logger.info(f"  TEST MODE: Using {sample_frac*100:.0f}% of data...")
+                train_ddf = train_ddf.sample(frac=sample_frac, random_state=42)
+                test_ddf = test_ddf.sample(frac=sample_frac, random_state=42)
+
+            # Repartition to consistent number
             target_partitions = 64
             train_ddf = train_ddf.repartition(npartitions=target_partitions)
             test_ddf = test_ddf.repartition(npartitions=target_partitions)
@@ -221,7 +219,8 @@ class CreditRiskPipeline:
 
             if os.path.exists(self.paths.val_data):
                 val_ddf = dd.read_parquet(self.paths.val_data)
-                # FIX: Repartition to a consistent number
+                if self.test_mode:
+                    val_ddf = val_ddf.sample(frac=sample_frac, random_state=42)
                 val_ddf = val_ddf.repartition(npartitions=target_partitions)
                 self.state['X_val'], self.state['y_val'] = self._split_features_target(val_ddf)
 
@@ -530,13 +529,31 @@ class CreditRiskPipeline:
         
         self._ensure_data_loaded("training")
         
-        use_tuned_params = kwargs.get('use_tuned_params', True)
-        force = kwargs.get('force', False)
+        # Check for sample fraction
+        sample_fraction = kwargs.get('sample_fraction', 1.0)
+        if sample_fraction < 1.0:
+            logger.info(f"  Using {sample_fraction*100:.0f}% of training data for testing...")
+            X_train_sampled = self.state['X_train'].sample(frac=sample_fraction, random_state=42)
+            y_train_sampled = self.state['y_train'].sample(frac=sample_fraction, random_state=42)
+            X_val_sampled = self.state['X_val'].sample(frac=sample_fraction, random_state=42)
+            y_val_sampled = self.state['y_val'].sample(frac=sample_fraction, random_state=42)
+        else:
+            X_train_sampled = self.state['X_train']
+            y_train_sampled = self.state['y_train']
+            X_val_sampled = self.state['X_val']
+            y_val_sampled = self.state['y_val']
         
-        if not force and self._check_models_exist():
-            logger.info("Models already exist. Loading...")
-            self._load_models()
-            return
+        specific_model = kwargs.get('specific_model', 'all')
+        force = kwargs.get('force', False)
+        use_tuned_params = kwargs.get('use_tuned_params', True)
+        
+        logger.info(f"Target model(s) to train: {specific_model.upper()}")
+        
+        # Load existing models
+        self._load_models()
+        models = self.state.get('models', {})
+        if models:
+            logger.info(f"Currently available models: {list(models.keys())}")
         
         # Load tuned parameters
         tuned_params = {}
@@ -544,117 +561,116 @@ class CreditRiskPipeline:
             try:
                 with open(f"{self.paths.results_dir}/tuned_params.json", 'r') as f:
                     tuned_params = json.load(f)
-                logger.info("Loaded tuned parameters")
             except:
                 logger.warning("No tuned parameters found, using defaults")
         
-        models = {}
-        failed_models = []  # <-- ADD THIS LINE
+        failed_models = []
 
         # 1. Logistic Regression
-        logger.info("\nTraining Logistic Regression with Dask...")
-        try:
-            lr = LogisticRegressionModel(
-                random_state=self.model_config.random_state,
-                **tuned_params.get('logistic', {})
-            )
-            lr.fit(self.state['X_train'], self.state['y_train'])
-            models['logistic'] = lr
-        except Exception as e:
-            logger.warning(f"  ⚠️ Logistic Regression failed: {e}")
-            failed_models.append('logistic')
+        if specific_model in ['all', 'logistic']:
+            if 'logistic' not in models or force:
+                logger.info("\nTraining Logistic Regression with Dask...")
+                try:
+                    lr = LogisticRegressionModel(random_state=self.model_config.random_state, **tuned_params.get('logistic', {}))
+                    lr.fit(X_train_sampled, y_train_sampled)
+                    models['logistic'] = lr
+                except Exception as e:
+                    logger.warning(f"Logistic Regression failed: {e}")
+                    failed_models.append('logistic')
+            else:
+                logger.info("Skipping Logistic Regression (Already trained)")
         
         # 2. Random Forest
-        logger.info("\nTraining Random Forest with Dask...")
-        try:
-            rf = RandomForestModel(
-                random_state=self.model_config.random_state,
-                **tuned_params.get('random_forest', {})
-            )
-            rf.fit(self.state['X_train'], self.state['y_train'])
-            models['random_forest'] = rf
-        except Exception as e:
-            logger.warning(f"  ⚠️ Random Forest failed: {e}")
-            failed_models.append('random_forest')
+        if specific_model in ['all', 'random_forest']:
+            if 'random_forest' not in models or force:
+                logger.info("\nTraining Random Forest with Dask...")
+                try:
+                    rf = RandomForestModel(random_state=self.model_config.random_state, **tuned_params.get('random_forest', {}))
+                    rf.fit(X_train_sampled, y_train_sampled)
+                    models['random_forest'] = rf
+                except Exception as e:
+                    logger.warning(f"Random Forest failed: {e}")
+                    failed_models.append('random_forest')
+            else:
+                logger.info("Skipping Random Forest (Already trained)")
         
         # 3. XGBoost
-        logger.info("\nTraining XGBoost with Dask...")
-        try:
-            xgb = XGBoostModel(
-                random_state=self.model_config.random_state,
-                **tuned_params.get('xgboost', {})
-            )
-            xgb.fit(
-                self.state['X_train'], self.state['y_train'],
-                self.state['X_val'], self.state['y_val']
-            )
-            models['xgboost'] = xgb
-        except Exception as e:
-            logger.warning(f"  ⚠️ XGBoost failed: {e}")
-            failed_models.append('xgboost')
+        if specific_model in ['all', 'xgboost']:
+            if 'xgboost' not in models or force:
+                logger.info("\nTraining XGBoost with Dask...")
+                try:
+                    xgb = XGBoostModel(random_state=self.model_config.random_state, **tuned_params.get('xgboost', {}))
+                    xgb.fit(X_train_sampled, y_train_sampled, X_val_sampled, y_val_sampled)
+                    models['xgboost'] = xgb
+                except Exception as e:
+                    logger.warning(f"XGBoost failed: {e}")
+                    failed_models.append('xgboost')
+            else:
+                logger.info("Skipping XGBoost (Already trained)")
         
         # 4. LightGBM
-        logger.info("\nTraining LightGBM with Dask...")
-        try:
-            lgb = LightGBMModel(
-                random_state=self.model_config.random_state,
-                **tuned_params.get('lightgbm', {})
-            )
-            lgb.fit(
-                self.state['X_train'], self.state['y_train'],
-                self.state['X_val'], self.state['y_val']
-            )
-            models['lightgbm'] = lgb
-        except Exception as e:
-            logger.warning(f"  ⚠️ LightGBM failed: {e}")
-            failed_models.append('lightgbm')
+        if specific_model in ['all', 'lightgbm']:
+            if 'lightgbm' not in models or force:
+                logger.info("\nTraining LightGBM with Dask...")
+                try:
+                    lgb = LightGBMModel(random_state=self.model_config.random_state, **tuned_params.get('lightgbm', {}))
+                    lgb.fit(X_train_sampled, y_train_sampled, X_val_sampled, y_val_sampled)
+                    models['lightgbm'] = lgb
+                except Exception as e:
+                    logger.warning(f"LightGBM failed: {e}")
+                    failed_models.append('lightgbm')
+            else:
+                logger.info("Skipping LightGBM (Already trained)")
         
         # 5. CatBoost
-        logger.info("\nTraining CatBoost...")
-        try:
-            cat = CatBoostModel(
-                random_state=self.model_config.random_state,
-                **tuned_params.get('catboost', {})
-            )
-            cat.fit(
-                self.state['X_train'], self.state['y_train'],
-                self.state['X_val'], self.state['y_val']
-            )
-            models['catboost'] = cat
-        except Exception as e:
-            logger.warning(f"  ⚠️ CatBoost failed: {e}")
-            failed_models.append('catboost')
+        if specific_model in ['all', 'catboost']:
+            if 'catboost' not in models or force:
+                logger.info("\nTraining CatBoost...")
+                try:
+                    cat = CatBoostModel(random_state=self.model_config.random_state, **tuned_params.get('catboost', {}))
+                    cat.fit(X_train_sampled, y_train_sampled, X_val_sampled, y_val_sampled)
+                    models['catboost'] = cat
+                except Exception as e:
+                    logger.warning(f"CatBoost failed: {e}")
+                    failed_models.append('catboost')
+            else:
+                logger.info("Skipping CatBoost (Already trained)")
         
-        # 6. Ensemble (only if at least 2 models succeeded)
-        if len(models) >= 2:
-            logger.info("\nTraining Stacking Ensemble with Dask...")
-            try:
-                ensemble = StackingEnsemble(
-                    base_models=list(models.values()),
-                    meta_model=LightGBMModel(
-                        random_state=self.model_config.random_state,
-                        is_unbalance=True
-                    ),
-                    cv_folds=min(3, self.model_config.cv_folds),
-                    random_state=self.model_config.random_state
-                )
-                ensemble.fit(
-                    self.state['X_train'], self.state['y_train'],
-                    self.state['X_val'], self.state['y_val']
-                )
-                models['ensemble'] = ensemble
-            except Exception as e:
-                logger.warning(f"  ⚠️ Ensemble failed: {e}")
-                failed_models.append('ensemble')
-        else:
-            logger.warning(f"  ⚠️ Not enough models for ensemble (have {len(models)}, need 2)")
+        # 6. Ensemble
+        if specific_model in ['all', 'ensemble']:
+            if 'ensemble' not in models or force:
+                # Get models strictly excluding CatBoost and Logistic Regression
+                valid_base_models = [
+                    m for name, m in models.items() 
+                    if name not in ['catboost', 'logistic', 'ensemble']
+                ]
+                
+                if len(valid_base_models) >= 2:
+                    logger.info(f"\nTraining Stacking Ensemble with base models: {[m.name for m in valid_base_models]}...")
+                    try:
+                        ensemble = StackingEnsemble(
+                            base_models=valid_base_models,
+                            meta_model=LightGBMModel(random_state=self.model_config.random_state, is_unbalance=True),
+                            cv_folds=min(3, self.model_config.cv_folds),
+                            random_state=self.model_config.random_state
+                        )
+                        ensemble.fit(X_train_sampled, y_train_sampled, X_val_sampled, y_val_sampled)
+                        models['ensemble'] = ensemble
+                        logger.info("Ensemble trained successfully")
+                    except Exception as e:
+                        logger.warning(f"Ensemble failed: {e}")
+                        failed_models.append('ensemble')
+                else:
+                    logger.warning(f"Skipping Ensemble: Need at least 2 valid base models. Found {len(valid_base_models)}.")
+            else:
+                logger.info("Skipping Ensemble (Already trained)")
         
         self.state['models'] = models
         self._save_models(models)
         
-        logger.info(f"Training completed. Models: {list(models.keys())}")
+        logger.info(f"\nTraining execution complete. Models ready: {list(models.keys())}")
         if failed_models:
-            logger.warning(f"Failed models: {failed_models}")
+            logger.warning(f"Failed models during this run: {failed_models}")
 
     
     def _run_evaluation(self, **kwargs):
@@ -991,6 +1007,12 @@ def parse_arguments():
                        help='Threads per Dask worker')
     parser.add_argument('--dry_run', action='store_true', 
                    help='Validate pipeline setup without executing heavy operations')
+    parser.add_argument('--test', action='store_true', 
+                       help='Run training on 10% of data for quick testing')
+    parser.add_argument('--train_model', type=str, default='all',
+                       choices=['all', 'logistic', 'random_forest', 'xgboost', 'lightgbm', 'catboost', 'ensemble'],
+                       help='Specific model to train when running the training module')
+
     
     return parser.parse_args()
 
@@ -1107,7 +1129,8 @@ def main():
     pipeline = CreditRiskPipeline(
         skip_data=args.skip_data,
         n_workers=args.n_workers,
-        threads_per_worker=args.threads_per_worker
+        threads_per_worker=args.threads_per_worker,
+        test_mode=args.test 
     )
     
     try:
@@ -1121,6 +1144,8 @@ def main():
                 elif module == 'target_creation':
                     kwargs['threshold'] = args.threshold
                 elif module in ['ingestion', 'cleaning', 'feature_engineering', 'training']:
+                    kwargs['force'] = args.force
+                elif module == 'training':  # --- UPDATE THIS BLOCK ---
                     kwargs['force'] = args.force
                 elif module == 'dataset_creation':
                     pass  # No special args needed

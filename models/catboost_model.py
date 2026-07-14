@@ -1,35 +1,5 @@
 # models/catboost_model.py
 """
-CatBoost model for credit risk with memory-efficient, partition-wise
-incremental training.
-
-WHY THIS APPROACH:
-CatBoost has no native Dask integration, and its `Pool` object is always a
-single in-memory (or single-file, via `catboost.Pool(data=<path>)` with
-libsvm/CatBoost-native formats only -- not Parquet) structure. The original
-implementation called `X.compute()` on every fit/predict, silently pulling
-the ENTIRE Dask DataFrame into driver RAM -- exactly the full-dataset
-materialization this refactor is meant to eliminate (requirement #8).
-
-Since CatBoost cannot consume Dask partitions natively, the memory-safe
-strategy is CatBoost's own supported mechanism for incremental training:
-`CatBoostClassifier.fit(..., init_model=<previous model>)`. We iterate over
-the Dask DataFrame's partitions one at a time -- each partition is pulled
-into memory, trained for a small number of boosting rounds continuing from
-the previous partition's model, and then released before the next partition
-is loaded. Peak memory is therefore bounded by the size of the LARGEST
-SINGLE PARTITION, not the full dataset -- the same out-of-core guarantee
-Dask gives XGBoost/LightGBM, implemented manually because CatBoost doesn't
-expose a partition-aware training API itself.
-
-The validation pool (used for early stopping) is still computed once into
-memory, since validation folds are expected to be a small fraction of the
-data (this mirrors how XGBoost/LightGBM's Dask integrations also keep a
-single eval set resident) -- the expensive/large object here is TRAIN, which
-this module never fully materializes.
-"""
-# models/catboost_model.py
-"""
 CatBoost model for credit risk - uses sklearn API (no Dask distributed).
 CatBoost handles categorical features natively.
 """
@@ -82,20 +52,56 @@ class CatBoostModel(BaseCreditRiskModel):
         return data
     
     def _identify_categorical_columns(self, X: pd.DataFrame) -> List[str]:
-        """Identify categorical columns."""
+        """
+        Identify categorical columns.
+        
+        FIX: Detect ALL non-numeric dtypes including:
+        - object, category (legacy)
+        - string (pandas StringDtype)
+        - columns with low cardinality
+        """
         cat_cols = []
         
-        # Columns with object/category dtype
-        cat_cols.extend(X.select_dtypes(include=['object', 'category']).columns.tolist())
-        
-        # Columns with few unique values (likely categorical)
+        # FIX: Use pandas API to detect ALL string-like types
         for col in X.columns:
-            if col not in cat_cols:
+            # Check for ANY non-numeric dtype
+            if pd.api.types.is_object_dtype(X[col]) or \
+               pd.api.types.is_string_dtype(X[col]) or \
+               pd.api.types.is_categorical_dtype(X[col]):
+                cat_cols.append(col)
+            else:
+                # Check for low-cardinality numeric columns (categorical in spirit)
                 unique_count = X[col].nunique()
-                if unique_count < 20 and X[col].dtype in ['int64', 'float64']:
+                if unique_count < 20 and unique_count > 1:
+                    # These are likely categorical flags/status codes
                     cat_cols.append(col)
         
         return cat_cols
+    
+    def _prepare_categoricals(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Prepare categorical columns for CatBoost.
+        CatBoost requires categorical columns as strings.
+        """
+        X_prepared = X.copy()
+        
+        if self.cat_features:
+            for col in self.cat_features:
+                if col in X_prepared.columns:
+                    # Convert to string, fill missing
+                    X_prepared[col] = X_prepared[col].fillna('MISSING')
+                    X_prepared[col] = X_prepared[col].astype(str)
+                    X_prepared[col] = X_prepared[col].replace('nan', 'MISSING')
+                    X_prepared[col] = X_prepared[col].replace('None', 'MISSING')
+                    X_prepared[col] = X_prepared[col].replace('', 'MISSING')
+        
+        # Ensure numeric columns are actually numeric
+        for col in X_prepared.columns:
+            if col not in (self.cat_features or []):
+                X_prepared[col] = pd.to_numeric(X_prepared[col], errors='coerce')
+                X_prepared[col] = X_prepared[col].fillna(0)
+        
+        return X_prepared
     
     def fit(
         self,
@@ -113,12 +119,17 @@ class CatBoostModel(BaseCreditRiskModel):
         y_train_pd = self._ensure_pandas(y_train)
         self.feature_names = X_train_pd.columns.tolist()
         
-        # Identify categorical features if not provided
+        # Identify categorical features
         if self.cat_features is None:
             self.cat_features = self._identify_categorical_columns(X_train_pd)
             logger.info(f"  Identified {len(self.cat_features)} categorical features")
+            if self.cat_features:
+                logger.info(f"  Categorical features: {self.cat_features[:10]}...")
         
-        # Create model using sklearn API
+        # Prepare data for CatBoost
+        X_train_prepared = self._prepare_categoricals(X_train_pd)
+        
+        # Create model
         self.model = CatBoostClassifier(
             iterations=self.iterations,
             depth=self.depth,
@@ -136,14 +147,17 @@ class CatBoostModel(BaseCreditRiskModel):
             X_val_pd = self._ensure_pandas(X_val)
             y_val_pd = self._ensure_pandas(y_val)
             
+            # Prepare validation data
+            X_val_prepared = self._prepare_categoricals(X_val_pd)
+            
             self.model.fit(
-                X_train_pd, y_train_pd,
-                eval_set=[(X_val_pd, y_val_pd)],
+                X_train_prepared, y_train_pd,
+                eval_set=[(X_val_prepared, y_val_pd)],
                 early_stopping_rounds=self.early_stopping_rounds,
                 verbose=False
             )
         else:
-            self.model.fit(X_train_pd, y_train_pd, verbose=False)
+            self.model.fit(X_train_prepared, y_train_pd, verbose=False)
         
         # Store feature importance
         try:
@@ -164,7 +178,8 @@ class CatBoostModel(BaseCreditRiskModel):
             raise ValueError("Model not trained. Call fit() first.")
         
         X_pd = self._ensure_pandas(X)
-        return self.model.predict_proba(X_pd)
+        X_prepared = self._prepare_categoricals(X_pd)
+        return self.model.predict_proba(X_prepared)
     
     def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
         """Predict classes."""

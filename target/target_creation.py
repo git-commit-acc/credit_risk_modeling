@@ -21,8 +21,8 @@ class TargetCreator:
     def __init__(
         self,
         spark: SparkSession,
-        default_threshold: int = 30,
-        lookahead_months: int = 12
+        default_threshold: int ,
+        lookahead_months: int 
     ):
         self.spark = spark
         self.default_threshold = default_threshold

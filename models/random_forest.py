@@ -69,38 +69,66 @@ class RandomForestModel(BaseCreditRiskModel):
             return data.compute()
         return data
     
+    # def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
+    #     """Encode categorical columns."""
+    #     X_encoded = X.copy()
+        
+    #     for col in X_encoded.columns:
+    #         if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
+    #             X_encoded[col] = X_encoded[col].fillna('MISSING')
+    #             X_encoded[col] = X_encoded[col].astype(str)
+    #             X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
+    #             X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
+    #             X_encoded[col] = X_encoded[col].astype('category').cat.codes
+        
+    #     return X_encoded
     def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Encode categorical columns."""
+        """Encode categorical columns for Random Forest."""
         X_encoded = X.copy()
         
         for col in X_encoded.columns:
-            if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
+            if pd.api.types.is_object_dtype(X_encoded[col]) or \
+            pd.api.types.is_string_dtype(X_encoded[col]) or \
+            pd.api.types.is_categorical_dtype(X_encoded[col]):
+                
                 X_encoded[col] = X_encoded[col].fillna('MISSING')
                 X_encoded[col] = X_encoded[col].astype(str)
                 X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
                 X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
-                X_encoded[col] = X_encoded[col].astype('category').cat.codes
+                X_encoded[col] = X_encoded[col].replace('', 'MISSING')
+                
+                if X_encoded[col].nunique() <= 1:
+                    X_encoded[col] = 0
+                else:
+                    X_encoded[col] = X_encoded[col].astype('category').cat.codes
         
         return X_encoded
     
-    def fit(
-        self,
-        X_train: Union[dd.DataFrame, pd.DataFrame],
-        y_train: Union[dd.Series, pd.Series],
-        **kwargs
-    ):
-        """Train Random Forest model using sklearn API."""
+    def fit( self, X_train: Union[dd.DataFrame, pd.DataFrame], y_train: Union[dd.Series, pd.Series], **kwargs,):
+        """Train Random Forest with sklearn API (converts Dask to pandas)."""
         logger.info(f"Training {self.name} (sklearn API)...")
+
+        # Convert to pandas (Dask is already preprocessed to be small enough)
+        if isinstance(X_train, dd.DataFrame):
+            X_train_pd = X_train.compute()
+        else:
+            X_train_pd = X_train
         
-        # Convert to pandas
-        X_train_pd = self._ensure_pandas(X_train)
-        y_train_pd = self._ensure_pandas(y_train)
-        self.feature_names = X_train_pd.columns.tolist()
+        if isinstance(y_train, dd.Series):
+            y_train_pd = y_train.compute()
+        else:
+            y_train_pd = y_train
         
-        # Encode categorical columns
-        X_train_encoded = self._encode_categorical(X_train_pd)
+        # IMPORTANT: All columns should already be numeric after cleaning
+        # If any string columns remain, convert them to numeric (shouldn't happen)
+        self.feature_names = list(X_train_pd.columns)
         
-        # Create model using sklearn API
+        # Check for any remaining string columns and convert them
+        for col in self.feature_names:
+            if X_train_pd[col].dtype == 'object':
+                logger.warning(f"  Column '{col}' is still object type. Converting to numeric...")
+                X_train_pd[col] = pd.to_numeric(X_train_pd[col], errors='coerce')
+        
         self.model = RandomForestClassifier(
             n_estimators=self.n_estimators,
             max_depth=self.max_depth,
@@ -109,21 +137,15 @@ class RandomForestModel(BaseCreditRiskModel):
             max_features=self.max_features,
             class_weight=self.class_weight,
             random_state=self.random_state,
-            n_jobs=self.n_jobs
+            n_jobs=self.n_jobs,
         )
-        
-        self.model.fit(X_train_encoded, y_train_pd)
-        
-        # Store feature importance
-        try:
-            importance = self.model.feature_importances_
-            if self.feature_names:
-                self.feature_importance = dict(
-                    zip(self.feature_names, importance)
-                )
-        except Exception as e:
-            logger.warning(f"Could not get feature importance: {e}")
-        
+        self.model.fit(X_train_pd, y_train_pd)
+
+        # Feature importance
+        self.feature_importance = dict(
+            zip(self.feature_names, self.model.feature_importances_)
+        )
+
         logger.info(f"{self.name} training completed.")
         return self
     

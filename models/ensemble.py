@@ -1,36 +1,8 @@
 # models/ensemble.py
 """
-Stacking ensemble for credit risk modeling with Dask support.
-
-FIX (requirement #9 + a real leakage bug): the original `fit()` generated
-meta-features by calling each already-fitted base model's `predict_proba`
-directly on the TRAINING data the base model had just been fit on. That
-means the meta-learner was trained on in-sample predictions -- base models
-that overfit (trees especially) produce artificially confident/accurate
-predictions on their own training rows, so the meta-learner learns to trust
-those signals more than it should, and the whole ensemble overfits. The
-constructor even accepted a `use_cv_predictions` flag advertising
-"proper" behavior, but the flag was never read anywhere in `fit()`.
-
-This version actually implements it: when `use_cv_predictions=True` (the
-default), TRAIN meta-features are generated via out-of-fold predictions --
-each base model is fit on `cv_folds - 1` folds and predicts on the held-out
-fold, so every training-set meta-feature is an honest out-of-sample
-prediction, exactly like proper stacking (Wolpert 1992 / standard sklearn
-StackingClassifier behavior). Base models are then refit once on the FULL
-training set for use at inference time. VAL/TEST meta-features continue to
-use the fully-trained base models directly (no CV needed there -- those
-rows were never used to fit any base model).
-
-Meta-features remain prediction-output-only (n_samples x n_base_models),
-never a duplicate of the full feature matrix -- satisfying requirement #9's
-"redesign to use prediction outputs instead of duplicating the full feature
-matrix" (this part of the original design was already correct; only the
-leakage bug is new here).
-"""
-# models/ensemble.py
-"""
-Stacking ensemble for credit risk modeling - uses sklearn API (no Dask distributed).
+Stacking ensemble for credit risk modeling.
+Uses sklearn's StackingClassifier with sklearn-compatible models only.
+Excludes CatBoost (not cloneable by sklearn due to cat_features).
 """
 
 import pandas as pd
@@ -38,20 +10,25 @@ import numpy as np
 import dask.dataframe as dd
 from sklearn.ensemble import StackingClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+import lightgbm as lgb
+import xgboost as xgb
 import logging
 from typing import List, Dict, Any, Optional, Union
 
 from models.base import BaseCreditRiskModel
-from models.logistic import LogisticRegressionModel
-from models.lightgbm_model import LightGBMModel
 
 logger = logging.getLogger(__name__)
+
+
+# List of model names that are sklearn-compatible (can be cloned)
+SKLEARN_COMPATIBLE_MODELS = ['logistic', 'random_forest', 'xgboost', 'lightgbm']
 
 
 class StackingEnsemble(BaseCreditRiskModel):
     """
     Stacking ensemble using sklearn's StackingClassifier.
-    No Dask distributed - uses sklearn API.
+    Only uses sklearn-compatible models (excludes CatBoost).
     """
     
     def __init__(
@@ -63,32 +40,35 @@ class StackingEnsemble(BaseCreditRiskModel):
         use_proba: bool = True
     ):
         super().__init__("Stacking Ensemble", random_state)
-        self.base_models = base_models
-        self.meta_model = meta_model or LogisticRegressionModel(
-            random_state=random_state,
-            class_weight='balanced'
-        )
+        
+        # Filter to only sklearn-compatible models
+        self.sklearn_models = []
+        self.base_model_names = []
+        
+        for model in base_models:
+            model_name = model.name.lower().replace(' ', '_')
+            
+            # Skip CatBoost (not cloneable)
+            if 'catboost' in model_name:
+                logger.info(f"  Skipping {model.name} for ensemble (not sklearn-cloneable)")
+                continue
+            
+            # Check if model has a fitted sklearn model
+            if hasattr(model, 'model') and model.model is not None:
+                self.sklearn_models.append((model_name, model.model))
+                self.base_model_names.append(model_name)
+                logger.info(f"  Adding {model.name} to ensemble")
+        
         self.cv_folds = cv_folds
         self.use_proba = use_proba
         self.is_distributed = False
         self.supports_dask_data = True
-        
-        self.base_model_predictions = None
     
     def _ensure_pandas(self, data):
         """Convert Dask to pandas if needed."""
         if isinstance(data, (dd.DataFrame, dd.Series)):
             return data.compute()
         return data
-    
-    def _get_estimators(self):
-        """Get sklearn estimators from base models."""
-        estimators = []
-        for model in self.base_models:
-            if hasattr(model, 'model'):
-                name = model.name.lower().replace(' ', '_')
-                estimators.append((name, model.model))
-        return estimators
     
     def fit(
         self,
@@ -106,14 +86,27 @@ class StackingEnsemble(BaseCreditRiskModel):
         y_train_pd = self._ensure_pandas(y_train)
         self.feature_names = X_train_pd.columns.tolist()
         
-        # Get base estimators
-        estimators = self._get_estimators()
+        # Ensure all columns are numeric
+        for col in self.feature_names:
+            if X_train_pd[col].dtype == 'object':
+                X_train_pd[col] = pd.to_numeric(X_train_pd[col], errors='coerce')
         
-        if len(estimators) < 2:
-            logger.warning(f"Need at least 2 base models for ensemble (have {len(estimators)})")
+        X_train_pd = X_train_pd.fillna(0)
+        
+        if len(self.sklearn_models) < 2:
+            logger.warning(f"Need at least 2 sklearn-compatible models for ensemble (have {len(self.sklearn_models)})")
+            if len(self.sklearn_models) == 1:
+                # Just use the single model
+                logger.info("  Using single model as fallback...")
+                self.model = self.sklearn_models[0][1]
+                
+                # Convert to numpy to avoid Dask-ML / Pandas clashes
+                self.model.fit(X_train_pd.to_numpy(), y_train_pd.to_numpy())
+                logger.info(f"{self.name} training completed (fallback mode).")
+                return self
             return self
         
-        # Create meta-learner
+        # Use sklearn's LogisticRegression as meta-learner
         final_estimator = LogisticRegression(
             class_weight='balanced',
             random_state=self.random_state,
@@ -123,16 +116,19 @@ class StackingEnsemble(BaseCreditRiskModel):
         
         # Create stacking ensemble
         self.model = StackingClassifier(
-            estimators=estimators,
+            estimators=self.sklearn_models,
             final_estimator=final_estimator,
             cv=self.cv_folds,
-            stack_method='predict_proba' if self.use_proba else 'predict'
+            stack_method='predict_proba' if self.use_proba else 'predict',
+            n_jobs=-1
         )
         
-        # Fit ensemble
-        self.model.fit(X_train_pd, y_train_pd)
+        # Fit ensemble (Convert to NumPy arrays here!)
+        X_train_np = X_train_pd.to_numpy()
+        y_train_np = y_train_pd.to_numpy()
+        self.model.fit(X_train_np, y_train_np)
         
-        logger.info(f"{self.name} training completed.")
+        logger.info(f"{self.name} training completed with {len(self.sklearn_models)} base models.")
         return self
     
     def predict_proba(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
@@ -141,7 +137,22 @@ class StackingEnsemble(BaseCreditRiskModel):
             raise ValueError("Ensemble not trained. Call fit() first.")
         
         X_pd = self._ensure_pandas(X)
-        return self.model.predict_proba(X_pd)
+        
+        # Ensure all columns are numeric
+        for col in X_pd.columns:
+            if X_pd[col].dtype == 'object':
+                X_pd[col] = pd.to_numeric(X_pd[col], errors='coerce')
+        
+        X_pd = X_pd.fillna(0)
+        
+        # Convert to numpy to avoid Dask-ML signature errors during prediction
+        X_np = X_pd.to_numpy()
+        
+        # If model is a single estimator (fallback)
+        if not hasattr(self.model, 'predict_proba'):
+            return self.model.predict_proba(X_np)
+        
+        return self.model.predict_proba(X_np)
     
     def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
         """Predict classes."""
@@ -153,6 +164,15 @@ class StackingEnsemble(BaseCreditRiskModel):
         if hasattr(self.model, 'final_estimator_'):
             if hasattr(self.model.final_estimator_, 'coef_'):
                 coef = self.model.final_estimator_.coef_[0]
-                if self.feature_names:
-                    return dict(zip(self.feature_names, np.abs(coef)))
+                feature_names = [name for name, _ in self.model.estimators]
+                if len(coef) == len(feature_names):
+                    return dict(zip(feature_names, np.abs(coef)))
         return {}
+    
+    def get_params(self, deep=True):
+        """Get model parameters."""
+        return {
+            'cv_folds': self.cv_folds,
+            'use_proba': self.use_proba,
+            'random_state': self.random_state
+        }

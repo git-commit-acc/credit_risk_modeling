@@ -194,12 +194,12 @@ def get_dask_client(
             dashboard_address=dashboard_address,
             local_directory=local_directory,
             silence_logs=logging.ERROR,
-            death_timeout=60,
+            death_timeout=60
             # Use 'managed' memory measure to avoid overreaction to unmanaged memory
-            memory_target_fraction=0.6,  # Start spilling at 60% of managed memory
-            memory_spill_fraction=0.7,   # More aggressive spilling at 70% of process memory
-            memory_pause_fraction=0.8,   # Pause at 80% of process memory
-            memory_terminate_fraction=0.95  # Terminate at 95% of process memory
+            # memory_target_fraction=0.6,  # Start spilling at 60% of managed memory
+            # memory_spill_fraction=0.7,   # More aggressive spilling at 70% of process memory
+            # memory_pause_fraction=0.8,   # Pause at 80% of process memory
+            # memory_terminate_fraction=0.95  # Terminate at 95% of process memory
         )
 
         _shared_client = Client(_shared_cluster)

@@ -80,18 +80,44 @@ class XGBoostModel(BaseCreditRiskModel):
             return data.compute()
         return data
     
+    # def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
+    #     """Encode categorical columns for XGBoost."""
+    #     X_encoded = X.copy()
+        
+    #     for col in X_encoded.columns:
+    #         if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
+    #             X_encoded[col] = X_encoded[col].fillna('MISSING')
+    #             X_encoded[col] = X_encoded[col].astype(str)
+    #             X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
+    #             X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
+    #             # Convert to categorical codes
+    #             X_encoded[col] = X_encoded[col].astype('category').cat.codes
+        
+    #     return X_encoded
+
     def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Encode categorical columns for XGBoost."""
+        """Encode categorical columns for models."""
         X_encoded = X.copy()
         
         for col in X_encoded.columns:
-            if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
+            # Check for ANY non-numeric dtype (object, string, category, etc.)
+            if pd.api.types.is_object_dtype(X_encoded[col]) or \
+            pd.api.types.is_string_dtype(X_encoded[col]) or \
+            pd.api.types.is_categorical_dtype(X_encoded[col]):
+                
+                # Fill missing values
                 X_encoded[col] = X_encoded[col].fillna('MISSING')
                 X_encoded[col] = X_encoded[col].astype(str)
                 X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
                 X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
-                # Convert to categorical codes
-                X_encoded[col] = X_encoded[col].astype('category').cat.codes
+                X_encoded[col] = X_encoded[col].replace('', 'MISSING')
+                
+                # Convert to categorical codes (0, 1, 2, ...)
+                # Handle case where all values become 'MISSING'
+                if X_encoded[col].nunique() <= 1:
+                    X_encoded[col] = 0
+                else:
+                    X_encoded[col] = X_encoded[col].astype('category').cat.codes
         
         return X_encoded
     
@@ -114,7 +140,7 @@ class XGBoostModel(BaseCreditRiskModel):
         # Encode categorical columns
         X_train_encoded = self._encode_categorical(X_train_pd)
         
-        # Create model using sklearn API
+        # Create model - eval_metric is set in constructor, not fit()
         self.model = xgb.XGBClassifier(
             n_estimators=self.n_estimators,
             max_depth=self.max_depth,
@@ -123,7 +149,7 @@ class XGBoostModel(BaseCreditRiskModel):
             colsample_bytree=self.colsample_bytree,
             scale_pos_weight=self.scale_pos_weight,
             tree_method=self.tree_method,
-            eval_metric=self.eval_metric,
+            eval_metric=self.eval_metric,  # Set here, not in fit()
             random_state=self.random_state,
             n_jobs=self.n_jobs,
             use_label_encoder=False
@@ -135,10 +161,10 @@ class XGBoostModel(BaseCreditRiskModel):
             y_val_pd = self._ensure_pandas(y_val)
             X_val_encoded = self._encode_categorical(X_val_pd)
             
+            # Only pass eval_set, nothing else
             self.model.fit(
                 X_train_encoded, y_train_pd,
                 eval_set=[(X_val_encoded, y_val_pd)],
-                early_stopping_rounds=self.early_stopping_rounds,
                 verbose=False
             )
         else:
