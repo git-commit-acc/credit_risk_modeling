@@ -1,29 +1,6 @@
 # models/random_forest.py
 """
-Random Forest model for credit risk with Dask support.
-
-IMPORTANT FIX: the original module did
-    `from dask_ml.ensemble import RandomForestClassifier`
-which does not exist in dask_ml (verified against dask-ml 2025.1.0's public
-API: `dask_ml.ensemble` only exports `BlockwiseVotingClassifier` and
-`BlockwiseVotingRegressor`). That import would raise `ImportError` the
-moment this module was imported, breaking the entire pipeline.
-
-dask_ml does not ship a true distributed random forest (there is no
-Dask-parallel tree-building equivalent to Dask-XGBoost/Dask-LightGBM).
-The correct, memory-efficient Dask-ML pattern for tree ensembles is
-`BlockwiseVotingClassifier`: it fits one `sklearn.ensemble.
-RandomForestClassifier` PER PARTITION (each partition read from disk,
-processed, and released -- only one partition's worth of data is ever
-resident in a worker's memory at a time), then combines all partition-level
-forests into a single voting ensemble at predict time. This is the
-documented Dask-ML approach for "big data, doesn't fit in RAM" random
-forests and is what requirement #6 ("use Dask-ML wherever appropriate") is
-asking for here.
-"""
-# models/random_forest.py
-"""
-Random Forest model for credit risk - uses sklearn API (no Dask distributed).
+Random Forest model for credit risk using sklearn API.
 """
 
 import pandas as pd
@@ -39,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class RandomForestModel(BaseCreditRiskModel):
-    """Random Forest Classifier using sklearn API (stable)."""
+    """Random Forest Classifier using sklearn API."""
     
     def __init__(
         self,
@@ -69,65 +46,28 @@ class RandomForestModel(BaseCreditRiskModel):
             return data.compute()
         return data
     
-    # def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
-    #     """Encode categorical columns."""
-    #     X_encoded = X.copy()
-        
-    #     for col in X_encoded.columns:
-    #         if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
-    #             X_encoded[col] = X_encoded[col].fillna('MISSING')
-    #             X_encoded[col] = X_encoded[col].astype(str)
-    #             X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
-    #             X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
-    #             X_encoded[col] = X_encoded[col].astype('category').cat.codes
-        
-    #     return X_encoded
-    def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Encode categorical columns for Random Forest."""
-        X_encoded = X.copy()
-        
-        for col in X_encoded.columns:
-            if pd.api.types.is_object_dtype(X_encoded[col]) or \
-            pd.api.types.is_string_dtype(X_encoded[col]) or \
-            pd.api.types.is_categorical_dtype(X_encoded[col]):
-                
-                X_encoded[col] = X_encoded[col].fillna('MISSING')
-                X_encoded[col] = X_encoded[col].astype(str)
-                X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
-                X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
-                X_encoded[col] = X_encoded[col].replace('', 'MISSING')
-                
-                if X_encoded[col].nunique() <= 1:
-                    X_encoded[col] = 0
-                else:
-                    X_encoded[col] = X_encoded[col].astype('category').cat.codes
-        
-        return X_encoded
+    def _ensure_numeric(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Ensure all columns are numeric."""
+        X_numeric = X.copy()
+        for col in X_numeric.columns:
+            if X_numeric[col].dtype == 'object':
+                X_numeric[col] = pd.to_numeric(X_numeric[col], errors='coerce')
+        return X_numeric.fillna(0)
     
-    def fit( self, X_train: Union[dd.DataFrame, pd.DataFrame], y_train: Union[dd.Series, pd.Series], **kwargs,):
-        """Train Random Forest with sklearn API (converts Dask to pandas)."""
-        logger.info(f"Training {self.name} (sklearn API)...")
-
-        # Convert to pandas (Dask is already preprocessed to be small enough)
-        if isinstance(X_train, dd.DataFrame):
-            X_train_pd = X_train.compute()
-        else:
-            X_train_pd = X_train
+    def fit(
+        self,
+        X_train: Union[dd.DataFrame, pd.DataFrame],
+        y_train: Union[dd.Series, pd.Series],
+        **kwargs
+    ):
+        """Train Random Forest model."""
+        logger.info(f"Training {self.name}...")
         
-        if isinstance(y_train, dd.Series):
-            y_train_pd = y_train.compute()
-        else:
-            y_train_pd = y_train
+        X_train_pd = self._ensure_pandas(X_train)
+        y_train_pd = self._ensure_pandas(y_train)
+        self.feature_names = X_train_pd.columns.tolist()
         
-        # IMPORTANT: All columns should already be numeric after cleaning
-        # If any string columns remain, convert them to numeric (shouldn't happen)
-        self.feature_names = list(X_train_pd.columns)
-        
-        # Check for any remaining string columns and convert them
-        for col in self.feature_names:
-            if X_train_pd[col].dtype == 'object':
-                logger.warning(f"  Column '{col}' is still object type. Converting to numeric...")
-                X_train_pd[col] = pd.to_numeric(X_train_pd[col], errors='coerce')
+        X_train_clean = self._ensure_numeric(X_train_pd)
         
         self.model = RandomForestClassifier(
             n_estimators=self.n_estimators,
@@ -139,9 +79,8 @@ class RandomForestModel(BaseCreditRiskModel):
             random_state=self.random_state,
             n_jobs=self.n_jobs,
         )
-        self.model.fit(X_train_pd, y_train_pd)
+        self.model.fit(X_train_clean, y_train_pd)
 
-        # Feature importance
         self.feature_importance = dict(
             zip(self.feature_names, self.model.feature_importances_)
         )
@@ -155,9 +94,8 @@ class RandomForestModel(BaseCreditRiskModel):
             raise ValueError("Model not trained. Call fit() first.")
         
         X_pd = self._ensure_pandas(X)
-        X_encoded = self._encode_categorical(X_pd)
-        
-        return self.model.predict_proba(X_encoded)
+        X_clean = self._ensure_numeric(X_pd)
+        return self.model.predict_proba(X_clean)
     
     def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
         """Predict classes."""
@@ -166,9 +104,7 @@ class RandomForestModel(BaseCreditRiskModel):
     
     def get_feature_importance(self) -> Dict[str, float]:
         """Get feature importance."""
-        if self.feature_importance is not None:
-            return self.feature_importance
-        return {}
+        return self.feature_importance if self.feature_importance else {}
     
     def get_params(self, deep=True):
         """Get model parameters."""

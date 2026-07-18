@@ -147,6 +147,7 @@ def trim_dask_workers_memory(client: Client) -> int:
 #         logger.info(f"Dask dashboard: {_client.dashboard_link}")
 #         return _client
 
+
 def get_dask_client(
     n_workers: int = 2,
     threads_per_worker: int = 1,
@@ -167,6 +168,8 @@ def get_dask_client(
     Returns:
         Dask Client instance
     """
+    local_directory = r"D:\Projects\credit_risk_scoring\cache\dask_temp"
+    
     global _shared_client, _shared_cluster
 
     if _shared_client is not None and _shared_client.status == 'running':

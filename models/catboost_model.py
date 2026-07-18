@@ -1,7 +1,6 @@
 # models/catboost_model.py
 """
-CatBoost model for credit risk - uses sklearn API (no Dask distributed).
-CatBoost handles categorical features natively.
+CatBoost model for credit risk with GPU support.
 """
 
 import pandas as pd
@@ -17,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class CatBoostModel(BaseCreditRiskModel):
-    """CatBoost Classifier using sklearn API (stable, native categorical support)."""
+    """CatBoost Classifier with GPU acceleration support."""
     
     def __init__(
         self,
@@ -30,7 +29,9 @@ class CatBoostModel(BaseCreditRiskModel):
         auto_class_weights: str = 'Balanced',
         verbose: bool = False,
         early_stopping_rounds: int = 50,
-        cat_features: Optional[List[str]] = None
+        cat_features: Optional[List[str]] = None,
+        use_gpu: bool = True,
+        devices: str = '0'
     ):
         super().__init__("CatBoost", random_state)
         self.iterations = iterations
@@ -42,6 +43,13 @@ class CatBoostModel(BaseCreditRiskModel):
         self.verbose = verbose
         self.early_stopping_rounds = early_stopping_rounds
         self.cat_features = cat_features
+        
+        # GPU Configuration
+        self.use_gpu = use_gpu
+        self.devices = devices
+        if use_gpu:
+            logger.info("CatBoost: GPU acceleration enabled")
+        
         self.is_distributed = False
         self.supports_dask_data = True
     
@@ -52,50 +60,34 @@ class CatBoostModel(BaseCreditRiskModel):
         return data
     
     def _identify_categorical_columns(self, X: pd.DataFrame) -> List[str]:
-        """
-        Identify categorical columns.
-        
-        FIX: Detect ALL non-numeric dtypes including:
-        - object, category (legacy)
-        - string (pandas StringDtype)
-        - columns with low cardinality
-        """
+        """Identify categorical columns."""
         cat_cols = []
         
-        # FIX: Use pandas API to detect ALL string-like types
         for col in X.columns:
-            # Check for ANY non-numeric dtype
             if pd.api.types.is_object_dtype(X[col]) or \
                pd.api.types.is_string_dtype(X[col]) or \
                pd.api.types.is_categorical_dtype(X[col]):
                 cat_cols.append(col)
             else:
-                # Check for low-cardinality numeric columns (categorical in spirit)
                 unique_count = X[col].nunique()
                 if unique_count < 20 and unique_count > 1:
-                    # These are likely categorical flags/status codes
                     cat_cols.append(col)
         
         return cat_cols
     
     def _prepare_categoricals(self, X: pd.DataFrame) -> pd.DataFrame:
-        """
-        Prepare categorical columns for CatBoost.
-        CatBoost requires categorical columns as strings.
-        """
+        """Prepare categorical columns for CatBoost."""
         X_prepared = X.copy()
         
         if self.cat_features:
             for col in self.cat_features:
                 if col in X_prepared.columns:
-                    # Convert to string, fill missing
                     X_prepared[col] = X_prepared[col].fillna('MISSING')
                     X_prepared[col] = X_prepared[col].astype(str)
                     X_prepared[col] = X_prepared[col].replace('nan', 'MISSING')
                     X_prepared[col] = X_prepared[col].replace('None', 'MISSING')
                     X_prepared[col] = X_prepared[col].replace('', 'MISSING')
         
-        # Ensure numeric columns are actually numeric
         for col in X_prepared.columns:
             if col not in (self.cat_features or []):
                 X_prepared[col] = pd.to_numeric(X_prepared[col], errors='coerce')
@@ -111,43 +103,44 @@ class CatBoostModel(BaseCreditRiskModel):
         y_val: Optional[Union[dd.Series, pd.Series]] = None,
         **kwargs
     ):
-        """Train CatBoost model using sklearn API."""
-        logger.info(f"Training {self.name} (sklearn API)...")
+        """Train CatBoost model with GPU support."""
+        logger.info(f"Training {self.name}...")
         
-        # Convert to pandas
         X_train_pd = self._ensure_pandas(X_train)
         y_train_pd = self._ensure_pandas(y_train)
         self.feature_names = X_train_pd.columns.tolist()
         
-        # Identify categorical features
+        logger.info(f"  Training with {len(X_train_pd):,} samples, {len(self.feature_names)} features")
+        
         if self.cat_features is None:
             self.cat_features = self._identify_categorical_columns(X_train_pd)
             logger.info(f"  Identified {len(self.cat_features)} categorical features")
-            if self.cat_features:
-                logger.info(f"  Categorical features: {self.cat_features[:10]}...")
         
-        # Prepare data for CatBoost
         X_train_prepared = self._prepare_categoricals(X_train_pd)
         
-        # Create model
-        self.model = CatBoostClassifier(
-            iterations=self.iterations,
-            depth=self.depth,
-            learning_rate=self.learning_rate,
-            l2_leaf_reg=self.l2_leaf_reg,
-            border_count=self.border_count,
-            auto_class_weights=self.auto_class_weights,
-            random_state=self.random_state,
-            verbose=self.verbose,
-            cat_features=self.cat_features
-        )
+        # Create model with GPU parameters
+        model_params = {
+            'iterations': self.iterations,
+            'depth': self.depth,
+            'learning_rate': self.learning_rate,
+            'l2_leaf_reg': self.l2_leaf_reg,
+            'border_count': self.border_count,
+            'auto_class_weights': self.auto_class_weights,
+            'random_state': self.random_state,
+            'verbose': self.verbose,
+            'cat_features': self.cat_features,
+        }
         
-        # Train with validation if provided
+        # Add GPU parameters
+        if self.use_gpu:
+            model_params['task_type'] = 'GPU'
+            model_params['devices'] = self.devices
+        
+        self.model = CatBoostClassifier(**model_params)
+        
         if X_val is not None and y_val is not None:
             X_val_pd = self._ensure_pandas(X_val)
             y_val_pd = self._ensure_pandas(y_val)
-            
-            # Prepare validation data
             X_val_prepared = self._prepare_categoricals(X_val_pd)
             
             self.model.fit(
@@ -159,7 +152,6 @@ class CatBoostModel(BaseCreditRiskModel):
         else:
             self.model.fit(X_train_prepared, y_train_pd, verbose=False)
         
-        # Store feature importance
         try:
             importance = self.model.feature_importances_
             if self.feature_names:
@@ -173,7 +165,6 @@ class CatBoostModel(BaseCreditRiskModel):
         return self
     
     def predict_proba(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict probabilities."""
         if self.model is None:
             raise ValueError("Model not trained. Call fit() first.")
         
@@ -182,18 +173,13 @@ class CatBoostModel(BaseCreditRiskModel):
         return self.model.predict_proba(X_prepared)
     
     def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict classes."""
         probs = self.predict_proba(X)
         return (probs[:, 1] >= 0.5).astype(int)
     
     def get_feature_importance(self) -> Dict[str, float]:
-        """Get feature importance."""
-        if self.feature_importance is not None:
-            return self.feature_importance
-        return {}
+        return self.feature_importance if self.feature_importance else {}
     
     def get_params(self, deep=True):
-        """Get model parameters."""
         return {
             "random_state": self.random_state,
             "iterations": self.iterations,
@@ -205,4 +191,6 @@ class CatBoostModel(BaseCreditRiskModel):
             "verbose": self.verbose,
             "cat_features": self.cat_features,
             "early_stopping_rounds": self.early_stopping_rounds,
+            "use_gpu": self.use_gpu,
+            "devices": self.devices
         }

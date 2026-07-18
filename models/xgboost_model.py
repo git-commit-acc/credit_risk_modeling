@@ -1,34 +1,6 @@
 # models/xgboost_model.py
 """
-XGBoost model for credit risk with native Dask-distributed training.
-
-FIX 1: the original module created a brand-new
-`dask.distributed.Client(n_workers=4, threads_per_worker=2)` inside every
-single `fit()` call, wrapped in a bare `try/except: pass` that silently
-swallowed the "a client is already running" error. Across base-model
-training, the stacking ensemble, and hyperparameter tuning (n_trials x
-cv_folds calls), this could spin up dozens of redundant local clusters and
-was a major source of unbounded RAM/CPU growth. It now reuses the single
-shared client from `models.dask_utils`.
-
-FIX 2 (correctness bug, not just an optimization): the dataset's
-categorical columns (PROPERTY_STATE, CHANNEL, OCCUPANCY_STATUS, etc. -- see
-config.features.categorical_features) come out of the Spark feature
-pipeline as raw strings, and this module previously handed them to
-`xgb_dask.DaskDMatrix` completely unprocessed. XGBoost's DMatrix rejects
-object/string columns outright ("DataFrame.dtypes for data must be int,
-float, bool or category") -- so training would fail the moment a
-categorical column was present, i.e. on essentially every real run of this
-dataset. Categorical columns are now cast to pandas `category` dtype via
-the shared `LazyCategoricalEncoder(ordinal_encode=False)` (fit once, lazily,
-partition-wise -- no full-dataset materialization), and
-`enable_categorical=True` is passed to `DaskDMatrix` so XGBoost consumes
-them with its native (split-search-based) categorical handling rather than
-a lossy hand-rolled integer encoding.
-"""
-# models/xgboost_model.py
-"""
-XGBoost model for credit risk - uses sklearn API (no Dask distributed).
+XGBoost model for credit risk with GPU support.
 """
 
 import pandas as pd
@@ -44,21 +16,23 @@ logger = logging.getLogger(__name__)
 
 
 class XGBoostModel(BaseCreditRiskModel):
-    """XGBoost Classifier using sklearn API (stable)."""
+    """XGBoost Classifier with GPU acceleration support."""
     
     def __init__(
         self,
         random_state: int = 42,
-        n_estimators: int = 100,
+        n_estimators: int = 200,
         max_depth: int = 6,
         learning_rate: float = 0.05,
         subsample: float = 0.8,
         colsample_bytree: float = 0.8,
         scale_pos_weight: float = 10.0,
         early_stopping_rounds: int = 50,
-        tree_method: str = 'hist',
+        tree_method: str = 'hist',  # Use 'hist' for GPU with device='cuda'
         eval_metric: str = 'logloss',
-        n_jobs: int = -1
+        n_jobs: int = -1,
+        use_gpu: bool = True,
+        gpu_id: int = 0
     ):
         super().__init__("XGBoost", random_state)
         self.n_estimators = n_estimators
@@ -68,7 +42,20 @@ class XGBoostModel(BaseCreditRiskModel):
         self.colsample_bytree = colsample_bytree
         self.scale_pos_weight = scale_pos_weight
         self.early_stopping_rounds = early_stopping_rounds
-        self.tree_method = tree_method
+        
+        # GPU Configuration
+        self.use_gpu = use_gpu
+        self.gpu_id = gpu_id
+        
+        # Use new XGBoost 2.0+ GPU parameters
+        if use_gpu:
+            self.tree_method = 'hist'
+            self.device = 'cuda'
+            logger.info("XGBoost: GPU acceleration enabled (device='cuda')")
+        else:
+            self.tree_method = tree_method
+            self.device = 'cpu'
+            
         self.eval_metric = eval_metric
         self.n_jobs = n_jobs
         self.is_distributed = False
@@ -80,40 +67,20 @@ class XGBoostModel(BaseCreditRiskModel):
             return data.compute()
         return data
     
-    # def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
-    #     """Encode categorical columns for XGBoost."""
-    #     X_encoded = X.copy()
-        
-    #     for col in X_encoded.columns:
-    #         if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
-    #             X_encoded[col] = X_encoded[col].fillna('MISSING')
-    #             X_encoded[col] = X_encoded[col].astype(str)
-    #             X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
-    #             X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
-    #             # Convert to categorical codes
-    #             X_encoded[col] = X_encoded[col].astype('category').cat.codes
-        
-    #     return X_encoded
-
     def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Encode categorical columns for models."""
+        """Encode categorical columns for XGBoost."""
         X_encoded = X.copy()
         
         for col in X_encoded.columns:
-            # Check for ANY non-numeric dtype (object, string, category, etc.)
             if pd.api.types.is_object_dtype(X_encoded[col]) or \
-            pd.api.types.is_string_dtype(X_encoded[col]) or \
-            pd.api.types.is_categorical_dtype(X_encoded[col]):
+               pd.api.types.is_string_dtype(X_encoded[col]) or \
+               pd.api.types.is_categorical_dtype(X_encoded[col]):
                 
-                # Fill missing values
                 X_encoded[col] = X_encoded[col].fillna('MISSING')
                 X_encoded[col] = X_encoded[col].astype(str)
                 X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
                 X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
-                X_encoded[col] = X_encoded[col].replace('', 'MISSING')
                 
-                # Convert to categorical codes (0, 1, 2, ...)
-                # Handle case where all values become 'MISSING'
                 if X_encoded[col].nunique() <= 1:
                     X_encoded[col] = 0
                 else:
@@ -129,44 +96,53 @@ class XGBoostModel(BaseCreditRiskModel):
         y_val: Optional[Union[dd.Series, pd.Series]] = None,
         **kwargs
     ):
-        """Train XGBoost model using sklearn API."""
-        logger.info(f"Training {self.name} (sklearn API)...")
+        """Train XGBoost model with GPU support."""
+        logger.info(f"Training {self.name}...")
         
         # Convert to pandas
         X_train_pd = self._ensure_pandas(X_train)
         y_train_pd = self._ensure_pandas(y_train)
         self.feature_names = X_train_pd.columns.tolist()
         
+        logger.info(f"  Training with {len(X_train_pd):,} samples, {len(self.feature_names)} features")
+        
         # Encode categorical columns
         X_train_encoded = self._encode_categorical(X_train_pd)
+        X_train_encoded = X_train_encoded.fillna(0)
         
-        # Create model - eval_metric is set in constructor, not fit()
-        self.model = xgb.XGBClassifier(
-            n_estimators=self.n_estimators,
-            max_depth=self.max_depth,
-            learning_rate=self.learning_rate,
-            subsample=self.subsample,
-            colsample_bytree=self.colsample_bytree,
-            scale_pos_weight=self.scale_pos_weight,
-            tree_method=self.tree_method,
-            eval_metric=self.eval_metric,  # Set here, not in fit()
-            random_state=self.random_state,
-            n_jobs=self.n_jobs,
-            use_label_encoder=False
-        )
+        # Create model with GPU parameters
+        model_params = {
+            'n_estimators': self.n_estimators,
+            'max_depth': self.max_depth,
+            'learning_rate': self.learning_rate,
+            'subsample': self.subsample,
+            'colsample_bytree': self.colsample_bytree,
+            'scale_pos_weight': self.scale_pos_weight,
+            'tree_method': self.tree_method,
+            'device': self.device,  # NEW: Use device instead of gpu_id
+            'eval_metric': self.eval_metric,
+            'random_state': self.random_state,
+            'n_jobs': self.n_jobs,
+        }
         
-        # Train with validation if provided
+        self.model = xgb.XGBClassifier(**model_params)
+        
         if X_val is not None and y_val is not None:
             X_val_pd = self._ensure_pandas(X_val)
             y_val_pd = self._ensure_pandas(y_val)
             X_val_encoded = self._encode_categorical(X_val_pd)
+            X_val_encoded = X_val_encoded.fillna(0)
             
-            # Only pass eval_set, nothing else
-            self.model.fit(
-                X_train_encoded, y_train_pd,
-                eval_set=[(X_val_encoded, y_val_pd)],
-                verbose=False
-            )
+            try:
+                self.model.fit(
+                    X_train_encoded, y_train_pd,
+                    eval_set=[(X_val_encoded, y_val_pd)],
+                    early_stopping_rounds=self.early_stopping_rounds,
+                    verbose=False
+                )
+            except TypeError:
+                logger.warning("  early_stopping not supported, training without it...")
+                self.model.fit(X_train_encoded, y_train_pd, verbose=False)
         else:
             self.model.fit(X_train_encoded, y_train_pd, verbose=False)
         
@@ -190,22 +166,17 @@ class XGBoostModel(BaseCreditRiskModel):
         
         X_pd = self._ensure_pandas(X)
         X_encoded = self._encode_categorical(X_pd)
-        
+        X_encoded = X_encoded.fillna(0)
         return self.model.predict_proba(X_encoded)
     
     def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict classes."""
         probs = self.predict_proba(X)
         return (probs[:, 1] >= 0.5).astype(int)
     
     def get_feature_importance(self) -> Dict[str, float]:
-        """Get feature importance."""
-        if self.feature_importance is not None:
-            return self.feature_importance
-        return {}
+        return self.feature_importance if self.feature_importance else {}
     
     def get_params(self, deep=True):
-        """Get model parameters."""
         return {
             'n_estimators': self.n_estimators,
             'max_depth': self.max_depth,
@@ -214,7 +185,10 @@ class XGBoostModel(BaseCreditRiskModel):
             'colsample_bytree': self.colsample_bytree,
             'scale_pos_weight': self.scale_pos_weight,
             'tree_method': self.tree_method,
+            'device': self.device,
             'eval_metric': self.eval_metric,
             'random_state': self.random_state,
-            'n_jobs': self.n_jobs
+            'n_jobs': self.n_jobs,
+            'use_gpu': self.use_gpu,
+            'gpu_id': self.gpu_id
         }

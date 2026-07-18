@@ -1,27 +1,6 @@
 # models/lightgbm_model.py
 """
-LightGBM model for credit risk with native Dask-distributed training.
-
-FIX 1: same client-lifecycle fix as models/xgboost_model.py -- see that
-module's docstring for details. Reuses the shared client from
-models.dask_utils instead of creating (and leaking) a new LocalCluster on
-every fit() call.
-
-FIX 2 (correctness bug): same root cause as XGBoostModel -- categorical
-columns arrive as raw strings from the Spark feature pipeline, and
-`lightgbm.dask.DaskLGBMClassifier` also rejects object/string dtype columns
-outright. LightGBM's native categorical support requires pandas `category`
-dtype columns (it reads the category codes directly rather than one-hot/
-ordinal encoding them). Categorical columns are now cast via the shared
-`LazyCategoricalEncoder(ordinal_encode=False)` (fit once, lazily,
-partition-wise) before every fit/predict call, and `categorical_feature`
-is passed explicitly so LightGBM's optimal-split categorical algorithm is
-used rather than treating them as numeric.
-"""
-# models/lightgbm_model.py
-"""
-LightGBM model for credit risk - uses sklearn API (no Dask distributed).
-This avoids socket pickling issues.
+LightGBM model for credit risk with GPU support.
 """
 
 import pandas as pd
@@ -32,17 +11,20 @@ import logging
 from typing import Dict, Any, Optional, Union
 
 from models.base import BaseCreditRiskModel
+import os
+# Suppress Boost filesystem warnings on Windows
+os.environ['BOOST_LOG_DISABLE'] = '1'
 
 logger = logging.getLogger(__name__)
 
 
 class LightGBMModel(BaseCreditRiskModel):
-    """LightGBM Classifier using sklearn API (stable, no socket pickling issues)."""
+    """LightGBM Classifier with GPU acceleration support."""
     
     def __init__(
         self,
         random_state: int = 42,
-        n_estimators: int = 100,  # Reduced for stability
+        n_estimators: int = 200,
         num_leaves: int = 31,
         max_depth: int = -1,
         learning_rate: float = 0.05,
@@ -52,7 +34,10 @@ class LightGBMModel(BaseCreditRiskModel):
         is_unbalance: bool = True,
         verbosity: int = -1,
         early_stopping_rounds: int = 50,
-        n_jobs: int = -1
+        n_jobs: int = -1,
+        use_gpu: bool = True,
+        gpu_platform_id: int = 0,
+        gpu_device_id: int = 0
     ):
         super().__init__("LightGBM", random_state)
         self.n_estimators = n_estimators
@@ -66,8 +51,17 @@ class LightGBMModel(BaseCreditRiskModel):
         self.verbosity = verbosity
         self.early_stopping_rounds = early_stopping_rounds
         self.n_jobs = n_jobs
-        self.is_distributed = False  # Not using Dask distributed
-        self.supports_dask_data = True  # Will convert to pandas
+        
+        # GPU Configuration
+        self.use_gpu = use_gpu
+        self.gpu_platform_id = gpu_platform_id
+        self.gpu_device_id = gpu_device_id
+        
+        if use_gpu:
+            logger.info("LightGBM: GPU acceleration enabled")
+        
+        self.is_distributed = False
+        self.supports_dask_data = True
     
     def _ensure_pandas(self, data):
         """Convert Dask to pandas if needed."""
@@ -75,35 +69,19 @@ class LightGBMModel(BaseCreditRiskModel):
             return data.compute()
         return data
     
-    # def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
-    #     """Encode categorical columns for LightGBM."""
-    #     X_encoded = X.copy()
-        
-    #     for col in X_encoded.columns:
-    #         if X_encoded[col].dtype == 'object' or X_encoded[col].dtype == 'category':
-    #             X_encoded[col] = X_encoded[col].fillna('MISSING')
-    #             X_encoded[col] = X_encoded[col].astype(str)
-    #             X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
-    #             X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
-    #             # Convert to categorical codes
-    #             X_encoded[col] = X_encoded[col].astype('category').cat.codes
-        
-    #     return X_encoded
     def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
         """Encode categorical columns for LightGBM."""
         X_encoded = X.copy()
         
         for col in X_encoded.columns:
-            # Use pandas API to detect ALL string-like types
             if pd.api.types.is_object_dtype(X_encoded[col]) or \
-            pd.api.types.is_string_dtype(X_encoded[col]) or \
-            pd.api.types.is_categorical_dtype(X_encoded[col]):
+               pd.api.types.is_string_dtype(X_encoded[col]) or \
+               pd.api.types.is_categorical_dtype(X_encoded[col]):
                 
                 X_encoded[col] = X_encoded[col].fillna('MISSING')
                 X_encoded[col] = X_encoded[col].astype(str)
                 X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
                 X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
-                X_encoded[col] = X_encoded[col].replace('', 'MISSING')
                 
                 if X_encoded[col].nunique() <= 1:
                     X_encoded[col] = 0
@@ -113,55 +91,63 @@ class LightGBMModel(BaseCreditRiskModel):
         return X_encoded
     
     def fit(
-    self,
-    X_train: Union[dd.DataFrame, pd.DataFrame],
-    y_train: Union[dd.Series, pd.Series],
-    X_val: Optional[Union[dd.DataFrame, pd.DataFrame]] = None,
-    y_val: Optional[Union[dd.Series, pd.Series]] = None,
-    **kwargs
+        self,
+        X_train: Union[dd.DataFrame, pd.DataFrame],
+        y_train: Union[dd.Series, pd.Series],
+        X_val: Optional[Union[dd.DataFrame, pd.DataFrame]] = None,
+        y_val: Optional[Union[dd.Series, pd.Series]] = None,
+        **kwargs
     ):
-        """Train LightGBM model using sklearn API."""
-        logger.info(f"Training {self.name} (sklearn API)...")
+        """Train LightGBM model with GPU support."""
+        logger.info(f"Training {self.name}...")
         
-        # Convert to pandas
         X_train_pd = self._ensure_pandas(X_train)
         y_train_pd = self._ensure_pandas(y_train)
         self.feature_names = X_train_pd.columns.tolist()
         
-        # Encode categorical columns
+        logger.info(f"  Training with {len(X_train_pd):,} samples, {len(self.feature_names)} features")
+        
         X_train_encoded = self._encode_categorical(X_train_pd)
+        X_train_encoded = X_train_encoded.fillna(0)
         
-        # Create model - verbosity controls output
-        self.model = lgb.LGBMClassifier(
-            n_estimators=self.n_estimators,
-            num_leaves=self.num_leaves,
-            max_depth=self.max_depth,
-            learning_rate=self.learning_rate,
-            feature_fraction=self.feature_fraction,
-            bagging_fraction=self.bagging_fraction,
-            bagging_freq=self.bagging_freq,
-            is_unbalance=self.is_unbalance,
-            random_state=self.random_state,
-            verbosity=-1,  # -1 = silent, 0 = warning, 1 = info
-            n_jobs=self.n_jobs
-        )
+        # Create model with GPU parameters
+        model_params = {
+            'n_estimators': self.n_estimators,
+            'num_leaves': self.num_leaves,
+            'max_depth': self.max_depth,
+            'learning_rate': self.learning_rate,
+            'feature_fraction': self.feature_fraction,
+            'bagging_fraction': self.bagging_fraction,
+            'bagging_freq': self.bagging_freq,
+            'is_unbalance': self.is_unbalance,
+            'random_state': self.random_state,
+            'verbosity': self.verbosity,
+            'n_jobs': self.n_jobs,
+        }
         
-        # Train with validation if provided
+        # Add GPU parameters
+        if self.use_gpu:
+            model_params['device'] = 'gpu'
+            model_params['gpu_platform_id'] = self.gpu_platform_id
+            model_params['gpu_device_id'] = self.gpu_device_id
+        
+        self.model = lgb.LGBMClassifier(**model_params)
+        
         if X_val is not None and y_val is not None:
             X_val_pd = self._ensure_pandas(X_val)
             y_val_pd = self._ensure_pandas(y_val)
             X_val_encoded = self._encode_categorical(X_val_pd)
+            X_val_encoded = X_val_encoded.fillna(0)
             
             self.model.fit(
                 X_train_encoded, y_train_pd,
                 eval_set=[(X_val_encoded, y_val_pd)],
                 eval_metric='logloss',
                 callbacks=[lgb.early_stopping(self.early_stopping_rounds)]
-                # FIX: removed 'verbose' from here - use verbosity in constructor
             )
         else:
             self.model.fit(X_train_encoded, y_train_pd)
-            
+        
         # Store feature importance
         try:
             importance = self.model.feature_importances_
@@ -176,29 +162,22 @@ class LightGBMModel(BaseCreditRiskModel):
         return self
     
     def predict_proba(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict probabilities."""
         if self.model is None:
             raise ValueError("Model not trained. Call fit() first.")
         
-        # Convert to pandas and encode
         X_pd = self._ensure_pandas(X)
         X_encoded = self._encode_categorical(X_pd)
-        
+        X_encoded = X_encoded.fillna(0)
         return self.model.predict_proba(X_encoded)
     
     def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict classes."""
         probs = self.predict_proba(X)
         return (probs[:, 1] >= 0.5).astype(int)
     
     def get_feature_importance(self) -> Dict[str, float]:
-        """Get feature importance."""
-        if self.feature_importance is not None:
-            return self.feature_importance
-        return {}
+        return self.feature_importance if self.feature_importance else {}
     
     def get_params(self, deep=True):
-        """Get model parameters."""
         return {
             'n_estimators': self.n_estimators,
             'num_leaves': self.num_leaves,
@@ -210,5 +189,8 @@ class LightGBMModel(BaseCreditRiskModel):
             'is_unbalance': self.is_unbalance,
             'random_state': self.random_state,
             'verbosity': self.verbosity,
-            'n_jobs': self.n_jobs
+            'n_jobs': self.n_jobs,
+            'use_gpu': self.use_gpu,
+            'gpu_platform_id': self.gpu_platform_id,
+            'gpu_device_id': self.gpu_device_id
         }

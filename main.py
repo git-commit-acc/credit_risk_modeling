@@ -20,6 +20,8 @@ from datetime import datetime
 import pickle
 import json
 from typing import Optional, Dict, Any
+import time
+import threading
 
 # Import project modules
 from config.config import config
@@ -191,36 +193,34 @@ class CreditRiskPipeline:
     _NON_FEATURE_COLUMNS = ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD', 'target']
 
     def _load_existing_data(self) -> bool:
-        """
-        Load existing data as Dask DataFrames directly from the Parquet
-        splits that Spark already wrote to disk.
-        """
-        logger.info("Loading train/val/test splits as Dask DataFrames "
-                    "(lazy Parquet read, no full-dataset materialization)...")
+        """Load existing data with sampling."""
+        logger.info("Loading train/val/test splits...")
 
         try:
-            train_ddf = dd.read_parquet(self.paths.train_data)
-            test_ddf = dd.read_parquet(self.paths.test_data)
-
-            # NEW: Apply test sampling if test_mode is enabled
-            if self.test_mode:
-                sample_frac = 0.1
-                logger.info(f"  TEST MODE: Using {sample_frac*100:.0f}% of data...")
-                train_ddf = train_ddf.sample(frac=sample_frac, random_state=42)
-                test_ddf = test_ddf.sample(frac=sample_frac, random_state=42)
-
-            # Repartition to consistent number
-            target_partitions = 64
+            # Use sampled data if available and enabled
+            if self.model_config.use_sample:
+                train_path = self.paths.sampled_train_data
+                val_path = self.paths.sampled_val_data
+                test_path = self.paths.sampled_test_data
+                logger.info(f"  Using sampled data from: {self.paths.sampled_features_dir}")
+            else:
+                train_path = self.paths.train_data
+                val_path = self.paths.val_data
+                test_path = self.paths.test_data
+            
+            train_ddf = dd.read_parquet(train_path)
+            test_ddf = dd.read_parquet(test_path)
+            
+            # Repartition
+            target_partitions = 16
             train_ddf = train_ddf.repartition(npartitions=target_partitions)
             test_ddf = test_ddf.repartition(npartitions=target_partitions)
 
             self.state['X_train'], self.state['y_train'] = self._split_features_target(train_ddf)
             self.state['X_test'], self.state['y_test'] = self._split_features_target(test_ddf)
 
-            if os.path.exists(self.paths.val_data):
-                val_ddf = dd.read_parquet(self.paths.val_data)
-                if self.test_mode:
-                    val_ddf = val_ddf.sample(frac=sample_frac, random_state=42)
+            if os.path.exists(val_path):
+                val_ddf = dd.read_parquet(val_path)
                 val_ddf = val_ddf.repartition(npartitions=target_partitions)
                 self.state['X_val'], self.state['y_val'] = self._split_features_target(val_ddf)
 
@@ -228,17 +228,16 @@ class CreditRiskPipeline:
             self.state['data_loaded'] = True
 
             logger.info("Successfully loaded existing data (Dask, lazy):")
-            logger.info(f"  Train partitions: {self.state['X_train'].npartitions}")
-            logger.info(f"  Test partitions:  {self.state['X_test'].npartitions}")
+            logger.info(f"  Train: {len(self.state['X_train']):,} records")
+            logger.info(f"  Test: {len(self.state['X_test']):,} records")
             if self.state.get('X_val') is not None:
-                logger.info(f"  Val partitions:   {self.state['X_val'].npartitions}")
+                logger.info(f"  Val: {len(self.state['X_val']):,} records")
 
             return True
-
         except Exception as e:
             logger.warning(f"Could not load existing data: {e}")
-            self.state['data_loaded'] = False
             return False
+        
 
     def _split_features_target(self, ddf: dd.DataFrame):
         """Lazily split a combined (features + identifiers + target) Dask
@@ -523,8 +522,53 @@ class CreditRiskPipeline:
         
         logger.info("Hyperparameter tuning completed.")
     
+    def _log_progress(self, stop_event, interval=300):
+        """
+        Log progress every `interval` seconds.
+        
+        Args:
+            stop_event: threading.Event to signal stop
+            interval: seconds between logs (default 300 = 5 min)
+        """
+        start_time = time.time()
+        while not stop_event.is_set():
+            elapsed = time.time() - start_time
+            elapsed_min = elapsed / 60
+            
+            # Check if Dask client is running
+            dask_status = "Unknown"
+            if hasattr(self, 'dask_client') and self.dask_client:
+                try:
+                    if self.dask_client.status == 'running':
+                        # Get worker info
+                        workers = self.dask_client.scheduler_info()['workers']
+                        dask_status = f"Running ({len(workers)} workers)"
+                    else:
+                        dask_status = self.dask_client.status
+                except:
+                    dask_status = "Not available"
+            
+            # Get model training status if available
+            model_status = "Training in progress..."
+            if hasattr(self.state, 'current_model'):
+                model_status = f"Training: {self.state.current_model}"
+            
+            logger.info(f"   PROGRESS UPDATE (Elapsed: {elapsed_min:.1f} min)")
+            logger.info(f"   Dask Status: {dask_status}")
+            logger.info(f"   Model Status: {model_status}")
+            logger.info(f"   Models Completed: {list(self.state.get('models_completed', []))}")
+            
+            # Wait for next interval
+            stop_event.wait(interval)
+        
+        logger.info("Progress logger stopped")
+
+
     def _run_training(self, **kwargs):
         """Run model training module with Dask."""
+        import time
+        import threading
+        
         logger.info("Running Model Training Module with Dask...")
         
         self._ensure_data_loaded("training")
@@ -546,12 +590,27 @@ class CreditRiskPipeline:
         specific_model = kwargs.get('specific_model', 'all')
         force = kwargs.get('force', False)
         use_tuned_params = kwargs.get('use_tuned_params', True)
+
+        # Initialize progress logging
+        stop_event = threading.Event()
+        progress_thread = threading.Thread(
+            target=self._log_progress,
+            args=(stop_event,),
+            kwargs={'interval': 300}  # 5 minutes
+        )
+        progress_thread.daemon = True
+        progress_thread.start()
         
         logger.info(f"Target model(s) to train: {specific_model.upper()}")
         
         # Load existing models
         self._load_models()
         models = self.state.get('models', {})
+        
+        # Initialize tracking for progress
+        self.state['models_completed'] = list(models.keys())
+        self.state['current_model'] = None
+        
         if models:
             logger.info(f"Currently available models: {list(models.keys())}")
         
@@ -561,82 +620,214 @@ class CreditRiskPipeline:
             try:
                 with open(f"{self.paths.results_dir}/tuned_params.json", 'r') as f:
                     tuned_params = json.load(f)
+                    logger.info("Loaded tuned parameters")
             except:
                 logger.warning("No tuned parameters found, using defaults")
         
         failed_models = []
 
-        # 1. Logistic Regression
+        # ============================================================
+        # 1. LOGISTIC REGRESSION
+        # ============================================================
         if specific_model in ['all', 'logistic']:
             if 'logistic' not in models or force:
-                logger.info("\nTraining Logistic Regression with Dask...")
+                logger.info("\n" + "=" * 60)
+                logger.info("Training Logistic Regression with Dask...")
+                logger.info("=" * 60)
+                self.state['current_model'] = 'Logistic Regression'
+                start_time = time.time()
                 try:
-                    lr = LogisticRegressionModel(random_state=self.model_config.random_state, **tuned_params.get('logistic', {}))
+                    lr_params = tuned_params.get('logistic', {})
+                    if 'random_state' not in lr_params:
+                        lr_params['random_state'] = self.model_config.random_state
+                    
+                    lr = LogisticRegressionModel(**lr_params)
                     lr.fit(X_train_sampled, y_train_sampled)
                     models['logistic'] = lr
+                    elapsed = time.time() - start_time
+                    logger.info(f" Logistic Regression completed in {elapsed/60:.1f} min")
+                    if 'logistic' not in self.state['models_completed']:
+                        self.state['models_completed'].append('logistic')
                 except Exception as e:
-                    logger.warning(f"Logistic Regression failed: {e}")
+                    elapsed = time.time() - start_time
+                    logger.warning(f" Logistic Regression failed after {elapsed/60:.1f} min: {e}")
                     failed_models.append('logistic')
             else:
                 logger.info("Skipping Logistic Regression (Already trained)")
-        
-        # 2. Random Forest
+                
+        # ============================================================
+        # 2. RANDOM FOREST (10% sample)
+        # ============================================================
         if specific_model in ['all', 'random_forest']:
             if 'random_forest' not in models or force:
-                logger.info("\nTraining Random Forest with Dask...")
+                logger.info("\n" + "=" * 60)
+                logger.info("Training Random Forest with Dask (10% sample)...")
+                logger.info("=" * 60)
+                self.state['current_model'] = 'Random Forest'
+                start_time = time.time()
                 try:
-                    rf = RandomForestModel(random_state=self.model_config.random_state, **tuned_params.get('random_forest', {}))
-                    rf.fit(X_train_sampled, y_train_sampled)
+                    logger.info("  Downsampling to 10% specifically for Random Forest...")
+                    
+                    # FIX: Convert to pandas first, then sample (works reliably)
+                    logger.info("  Converting training data to pandas (for sampling)...")
+                    X_train_pd = self.state['X_train'].compute()
+                    y_train_pd = self.state['y_train'].compute()
+                    
+                    total_rows = len(X_train_pd)
+                    sample_frac = 0.1
+                    sample_size = int(total_rows * sample_frac)
+                    logger.info(f"  Total rows: {total_rows:,}, sampling {sample_size:,} rows")
+                    
+                    # Sample using pandas (reliable)
+                    import numpy as np
+                    np.random.seed(42)
+                    indices = np.random.choice(total_rows, size=sample_size, replace=False)
+                    indices = sorted(indices)
+                    
+                    X_rf_sample = X_train_pd.iloc[indices]
+                    y_rf_sample = y_train_pd.iloc[indices]
+                    
+                    # Reset indices
+                    X_rf_sample = X_rf_sample.reset_index(drop=True)
+                    y_rf_sample = y_rf_sample.reset_index(drop=True)
+                    
+                    logger.info(f"  Sampled X: {len(X_rf_sample):,}, Sampled y: {len(y_rf_sample):,}")
+                    
+                    if len(X_rf_sample) != len(y_rf_sample):
+                        raise ValueError(f"Sample mismatch: X={len(X_rf_sample)}, y={len(y_rf_sample)}")
+                    
+                    rf_params = tuned_params.get('random_forest', {})
+                    rf_params.update({
+                        'random_state': self.model_config.random_state,
+                        'n_estimators': 50,
+                        'max_depth': 8,
+                    })
+                    
+                    rf = RandomForestModel(**rf_params)
+                    rf.fit(X_rf_sample, y_rf_sample)
                     models['random_forest'] = rf
+                    elapsed = time.time() - start_time
+                    logger.info(f"Random Forest completed in {elapsed/60:.1f} min")
+                    if 'random_forest' not in self.state['models_completed']:
+                        self.state['models_completed'].append('random_forest')
                 except Exception as e:
-                    logger.warning(f"Random Forest failed: {e}")
+                    elapsed = time.time() - start_time
+                    import traceback
+                    logger.warning(f"Random Forest failed after {elapsed/60:.1f} min: {e}")
+                    logger.debug(traceback.format_exc())
                     failed_models.append('random_forest')
             else:
                 logger.info("Skipping Random Forest (Already trained)")
-        
+
+
         # 3. XGBoost
         if specific_model in ['all', 'xgboost']:
             if 'xgboost' not in models or force:
-                logger.info("\nTraining XGBoost with Dask...")
+                logger.info("\n" + "=" * 60)
+                logger.info("Training XGBoost with GPU...")
+                logger.info("=" * 60)
+                self.state['current_model'] = 'XGBoost'
+                start_time = time.time()
                 try:
-                    xgb = XGBoostModel(random_state=self.model_config.random_state, **tuned_params.get('xgboost', {}))
+                    xgb_params = tuned_params.get('xgboost', {})
+                    xgb_params.update({
+                        'random_state': self.model_config.random_state,
+                        'n_estimators': 200,
+                        'use_gpu': self.model_config.use_gpu,
+                        'gpu_id': self.model_config.gpu_id,
+                    })
+                    
+                    xgb = XGBoostModel(**xgb_params)
                     xgb.fit(X_train_sampled, y_train_sampled, X_val_sampled, y_val_sampled)
                     models['xgboost'] = xgb
+                    
+                    # FIX: Save immediately after training
+                    with open(f"{self.paths.models_dir}/model_xgboost.pkl", 'wb') as f:
+                        pickle.dump(xgb, f)
+                    logger.info(f"Saved xgboost model")
+                    
+                    elapsed = time.time() - start_time
+                    logger.info(f"XGBoost completed in {elapsed/60:.1f} min")
+                    if 'xgboost' not in self.state['models_completed']:
+                        self.state['models_completed'].append('xgboost')
                 except Exception as e:
-                    logger.warning(f"XGBoost failed: {e}")
+                    elapsed = time.time() - start_time
+                    logger.warning(f"XGBoost failed after {elapsed/60:.1f} min: {e}")
                     failed_models.append('xgboost')
             else:
                 logger.info("Skipping XGBoost (Already trained)")
-        
+        # ============================================================
         # 4. LightGBM
+        # ============================================================
+
+                # 4. LightGBM
         if specific_model in ['all', 'lightgbm']:
             if 'lightgbm' not in models or force:
-                logger.info("\nTraining LightGBM with Dask...")
+                logger.info("\n" + "=" * 60)
+                logger.info("Training LightGBM (CPU fallback)...")  # Changed from GPU
+                logger.info("=" * 60)
+                self.state['current_model'] = 'LightGBM'
+                start_time = time.time()
                 try:
-                    lgb = LightGBMModel(random_state=self.model_config.random_state, **tuned_params.get('lightgbm', {}))
+                    lgb_params = tuned_params.get('lightgbm', {})
+                    lgb_params.update({
+                        'random_state': self.model_config.random_state,
+                        'n_estimators': 200,
+                        'use_gpu': False,  # Force CPU
+                        # 'gpu_device_id': self.model_config.gpu_id,
+                    })
+                    
+                    lgb = LightGBMModel(**lgb_params)
                     lgb.fit(X_train_sampled, y_train_sampled, X_val_sampled, y_val_sampled)
                     models['lightgbm'] = lgb
+                    elapsed = time.time() - start_time
+                    logger.info(f"LightGBM completed in {elapsed/60:.1f} min")
+                    if 'lightgbm' not in self.state['models_completed']:
+                        self.state['models_completed'].append('lightgbm')
                 except Exception as e:
-                    logger.warning(f"LightGBM failed: {e}")
+                    elapsed = time.time() - start_time
+                    logger.warning(f"LightGBM failed after {elapsed/60:.1f} min: {e}")
                     failed_models.append('lightgbm')
             else:
                 logger.info("Skipping LightGBM (Already trained)")
-        
+                
+        # ============================================================
         # 5. CatBoost
+        # ============================================================
+        
         if specific_model in ['all', 'catboost']:
             if 'catboost' not in models or force:
-                logger.info("\nTraining CatBoost...")
+                logger.info("\n" + "=" * 60)
+                logger.info("Training CatBoost with GPU...")
+                logger.info("=" * 60)
+                self.state['current_model'] = 'CatBoost'
+                start_time = time.time()
                 try:
-                    cat = CatBoostModel(random_state=self.model_config.random_state, **tuned_params.get('catboost', {}))
+                    cat_params = tuned_params.get('catboost', {})
+                    cat_params.update({
+                        'random_state': self.model_config.random_state,
+                        'iterations': 100,
+                        'use_gpu': self.model_config.use_gpu,
+                        'devices': str(self.model_config.gpu_id),
+                    })
+                    
+                    cat = CatBoostModel(**cat_params)
                     cat.fit(X_train_sampled, y_train_sampled, X_val_sampled, y_val_sampled)
                     models['catboost'] = cat
+                    elapsed = time.time() - start_time
+                    logger.info(f"CatBoost completed in {elapsed/60:.1f} min")
+                    if 'catboost' not in self.state['models_completed']:
+                        self.state['models_completed'].append('catboost')
                 except Exception as e:
-                    logger.warning(f"CatBoost failed: {e}")
+                    elapsed = time.time() - start_time
+                    logger.warning(f"CatBoost failed after {elapsed/60:.1f} min: {e}")
                     failed_models.append('catboost')
             else:
                 logger.info("Skipping CatBoost (Already trained)")
         
-        # 6. Ensemble
+        # ============================================================
+        # 6. ENSEMBLE
+        # ============================================================
         if specific_model in ['all', 'ensemble']:
             if 'ensemble' not in models or force:
                 # Get models strictly excluding CatBoost and Logistic Regression
@@ -646,33 +837,53 @@ class CreditRiskPipeline:
                 ]
                 
                 if len(valid_base_models) >= 2:
-                    logger.info(f"\nTraining Stacking Ensemble with base models: {[m.name for m in valid_base_models]}...")
+                    logger.info("\n" + "=" * 60)
+                    logger.info(f"Training Stacking Ensemble with base models: {[m.name for m in valid_base_models]}...")
+                    logger.info("=" * 60)
+                    self.state['current_model'] = 'Ensemble'
+                    start_time = time.time()
                     try:
                         ensemble = StackingEnsemble(
                             base_models=valid_base_models,
-                            meta_model=LightGBMModel(random_state=self.model_config.random_state, is_unbalance=True),
+                            meta_model=LightGBMModel(
+                                random_state=self.model_config.random_state, 
+                                is_unbalance=True
+                            ),
                             cv_folds=min(3, self.model_config.cv_folds),
                             random_state=self.model_config.random_state
                         )
                         ensemble.fit(X_train_sampled, y_train_sampled, X_val_sampled, y_val_sampled)
                         models['ensemble'] = ensemble
-                        logger.info("Ensemble trained successfully")
+                        elapsed = time.time() - start_time
+                        logger.info(f" Ensemble completed in {elapsed/60:.1f} min")
+                        if 'ensemble' not in self.state['models_completed']:
+                            self.state['models_completed'].append('ensemble')
                     except Exception as e:
-                        logger.warning(f"Ensemble failed: {e}")
+                        elapsed = time.time() - start_time
+                        logger.warning(f" Ensemble failed after {elapsed/60:.1f} min: {e}")
                         failed_models.append('ensemble')
                 else:
                     logger.warning(f"Skipping Ensemble: Need at least 2 valid base models. Found {len(valid_base_models)}.")
             else:
                 logger.info("Skipping Ensemble (Already trained)")
         
+        # ============================================================
+        # SAVE MODELS
+        # ============================================================
         self.state['models'] = models
         self._save_models(models)
         
-        logger.info(f"\nTraining execution complete. Models ready: {list(models.keys())}")
+        # Stop progress logging
+        stop_event.set()
+        progress_thread.join(timeout=2)
+        
+        logger.info("\n" + "=" * 60)
+        logger.info(f"Training execution complete. Models ready: {list(models.keys())}")
         if failed_models:
             logger.warning(f"Failed models during this run: {failed_models}")
+        logger.info("=" * 60)
 
-    
+
     def _run_evaluation(self, **kwargs):
         """Run model evaluation module with Dask."""
         logger.info("Running Model Evaluation Module with Dask...")
@@ -834,42 +1045,191 @@ class CreditRiskPipeline:
         self.state['score_results'] = results_df
     
     def _run_visualization(self, **kwargs):
-        """Run visualization module."""
+        """Run visualization module to generate plots and reports."""
         logger.info("Running Visualization Module...")
         
+        # Ensure models are loaded
+        if not self.state['models']:
+            if self.skip_data:
+                self._load_models()
+            else:
+                logger.warning("Models not trained. Running training first...")
+                self._run_training()
+        
+        # Ensure results are available
         if not self.state['results']:
             if self.skip_data:
                 try:
                     results_df = pd.read_csv(f"{self.paths.results_dir}/model_results.csv")
-                    self.state['results'] = results_df.to_dict('records')
-                except:
-                    raise RuntimeError("Results not found. Please run evaluation first.")
+                    self.state['results'] = {}
+                    for _, row in results_df.iterrows():
+                        self.state['results'][row['model']] = row.to_dict()
+                    logger.info("Loaded results from CSV")
+                except Exception as e:
+                    logger.warning(f"Could not load results: {e}")
+                    logger.info("Running evaluation first...")
+                    self._run_evaluation()
             else:
-                logger.warning("Evaluation results not available. Running evaluation first...")
+                logger.info("Running evaluation first...")
                 self._run_evaluation()
         
+        # Get test data - compute to pandas to avoid Dask issues
+        self._ensure_data_loaded("visualization")
+        
+        # FIX: Convert to pandas for prediction to avoid Dask scheduling issues
+        logger.info("Loading test data as pandas (for visualization)...")
+        X_test_pd = self.state['X_test'].compute()
+        y_test_np = self.state['y_test'].compute().values
+        
+        # Create visualizer
         visualizer = CreditRiskVisualizer(save_dir=f"{self.paths.results_dir}/plots")
         
-        if isinstance(self.state['results'], dict):
-            y_test_np = self.state['y_test'].compute().values
-            for name, metrics in self.state['results'].items():
-                if 'feature_importance' in metrics:
+        # Process each model
+        for name, model in self.state['models'].items():
+            logger.info(f"Generating visualizations for {name}...")
+            
+            try:
+                # FIX: Convert X to pandas if needed for prediction
+                if hasattr(model, 'supports_dask_data') and model.supports_dask_data:
+                    # Some models can handle Dask directly
+                    X_pred = self.state['X_test']
+                else:
+                    X_pred = X_test_pd
+                
+                # Get predictions
+                y_proba = model.predict_proba(X_pred)[:, 1]
+                
+                # If prediction returned a Dask array, compute it
+                if hasattr(y_proba, 'compute'):
+                    y_proba = y_proba.compute()
+                
+                y_pred = (y_proba >= 0.5).astype(int)
+                
+                # Get feature importance if available
+                feature_importance = {}
+                if hasattr(model, 'get_feature_importance'):
+                    feature_importance = model.get_feature_importance()
+                
+                # Create individual model report
+                if feature_importance:
                     visualizer.create_model_evaluation_report(
                         y_test_np,
-                        metrics.get('y_proba'),
-                        metrics.get('y_pred'),
+                        y_proba,
+                        y_pred,
                         name,
-                        metrics.get('feature_importance'),
+                        feature_importance,
                         save_name=f"{name}_report"
                     )
-            
-            visualizer.create_ensemble_comparison_plot(
-                self.state['results'],
-                save_name="ensemble_comparison"
-            )
+                    logger.info(f"  Created report for {name}")
+                else:
+                    logger.warning(f"  No feature importance for {name}, skipping report")
+                    
+            except Exception as e:
+                logger.warning(f"  Could not generate visualizations for {name}: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
         
-        logger.info("Visualizations created successfully")
-    
+        # Create ensemble comparison plot (using stored results)
+        if self.state['results']:
+            try:
+                visualizer.create_ensemble_comparison_plot(
+                    self.state['results'],
+                    save_name="ensemble_comparison"
+                )
+                logger.info("Created ensemble comparison plot")
+            except Exception as e:
+                logger.warning(f"Could not create ensemble comparison: {e}")
+        
+        # Create additional plots
+        self._create_additional_plots()
+        
+        logger.info(f"Visualizations saved to: {self.paths.results_dir}/plots")
+
+    def _create_additional_plots(self):
+        """Create additional diagnostic plots."""
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            from sklearn.metrics import roc_curve, auc, confusion_matrix
+            
+            plots_dir = f"{self.paths.results_dir}/plots"
+            os.makedirs(plots_dir, exist_ok=True)
+            
+            # Load results
+            results_df = pd.read_csv(f"{self.paths.results_dir}/model_results.csv")
+            
+            # 1. ROC-AUC Comparison Bar Chart
+            fig, ax = plt.subplots(figsize=(10, 6))
+            bars = ax.bar(results_df['model'], results_df['roc_auc'], 
+                        color=['#2ecc71', '#3498db', '#e74c3c', '#f39c12', '#9b59b6', '#1abc9c'])
+            ax.axhline(y=0.5, color='red', linestyle='--', label='Random (0.5)')
+            ax.set_ylim(0, 1)
+            ax.set_ylabel('ROC-AUC Score')
+            ax.set_title('Model ROC-AUC Comparison')
+            ax.legend()
+            
+            # Add value labels on bars
+            for bar, val in zip(bars, results_df['roc_auc']):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+                        f'{val:.3f}', ha='center', va='bottom', fontsize=10)
+            
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig(f"{plots_dir}/roc_auc_comparison.png", dpi=150)
+            plt.close()
+            logger.info(f"  Saved: roc_auc_comparison.png")
+            
+            # 2. All Metrics Heatmap
+            metrics = ['roc_auc', 'pr_auc', 'f1', 'balanced_accuracy', 'ks_statistic']
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            heatmap_data = results_df.set_index('model')[metrics]
+            sns.heatmap(heatmap_data, annot=True, fmt='.3f', cmap='RdYlGn', 
+                        vmin=0, vmax=1, ax=ax)
+            ax.set_title('Model Performance Heatmap')
+            plt.tight_layout()
+            plt.savefig(f"{plots_dir}/performance_heatmap.png", dpi=150)
+            plt.close()
+            logger.info(f"  Saved: performance_heatmap.png")
+            
+            # 3. Metric Distribution
+            fig, ax = plt.subplots(figsize=(12, 6))
+            results_melted = results_df.melt(id_vars=['model'], 
+                                            value_vars=['roc_auc', 'pr_auc', 'f1', 'ks_statistic'],
+                                            var_name='metric', value_name='score')
+            sns.barplot(data=results_melted, x='model', y='score', hue='metric', ax=ax)
+            ax.set_title('Model Performance by Metric')
+            ax.legend(bbox_to_anchor=(1.05, 1))
+            ax.set_ylim(0, 1)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig(f"{plots_dir}/metrics_comparison.png", dpi=150)
+            plt.close()
+            logger.info(f"  Saved: metrics_comparison.png")
+            
+            # 4. Model Ranking (if evaluation metrics available)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sorted_df = results_df.sort_values('roc_auc', ascending=True)
+            colors = ['#e74c3c' if i < 2 else '#f39c12' if i < 4 else '#2ecc71' 
+                    for i in range(len(sorted_df))]
+            ax.barh(sorted_df['model'], sorted_df['roc_auc'], color=colors)
+            ax.set_xlabel('ROC-AUC')
+            ax.set_title('Model Ranking by ROC-AUC')
+            ax.axvline(x=0.5, color='red', linestyle='--', label='Random')
+            ax.legend()
+            
+            for i, (_, row) in enumerate(sorted_df.iterrows()):
+                ax.text(row['roc_auc'] + 0.01, i, f"{row['roc_auc']:.3f}", 
+                        va='center', fontsize=10)
+            
+            plt.tight_layout()
+            plt.savefig(f"{plots_dir}/model_ranking.png", dpi=150)
+            plt.close()
+            logger.info(f"  Saved: model_ranking.png")
+            
+        except Exception as e:
+            logger.warning(f"Could not create additional plots: {e}")
+        
     def _run_full_pipeline(self):
         """Run the complete pipeline from ingestion to visualization."""
         logger.info("Running Full Pipeline...")
