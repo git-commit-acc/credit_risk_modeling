@@ -95,24 +95,57 @@ class HyperparameterTuner:
         self.best_score: Optional[float] = None
         self.study: Optional[optuna.Study] = None
 
-    def _sample_data(self, X: Union[dd.DataFrame, pd.DataFrame], y: Union[dd.Series, pd.Series]):
-        """Sample a bounded slice of the data for tuning. This is the only
-        place `.compute()` is called in this module, and it is computing a
-        SAMPLE (sample_fraction, default 10%), never the full dataset."""
-        if isinstance(X, dd.DataFrame):
-            X_sampled = X.sample(frac=self.sample_fraction, random_state=self.random_state)
-            y_sampled = y.sample(frac=self.sample_fraction, random_state=self.random_state)
-            X_sampled = X_sampled.compute()
-            y_sampled = y_sampled.compute()
-        else:
-            n_samples = int(len(X) * self.sample_fraction)
-            indices = np.random.RandomState(self.random_state).choice(
-                len(X), size=min(n_samples, len(X)), replace=False
-            )
-            X_sampled = X.iloc[indices]
-            y_sampled = y.iloc[indices]
+    # def _sample_data(self, X: Union[dd.DataFrame, pd.DataFrame], y: Union[dd.Series, pd.Series]):
+    #     """Sample a bounded slice of the data for tuning. This is the only
+    #     place `.compute()` is called in this module, and it is computing a
+    #     SAMPLE (sample_fraction, default 10%), never the full dataset."""
+    #     if isinstance(X, dd.DataFrame):
+    #         X_sampled = X.sample(frac=self.sample_fraction, random_state=self.random_state)
+    #         y_sampled = y.sample(frac=self.sample_fraction, random_state=self.random_state)
+    #         X_sampled = X_sampled.compute()
+    #         y_sampled = y_sampled.compute()
+    #     else:
+    #         n_samples = int(len(X) * self.sample_fraction)
+    #         indices = np.random.RandomState(self.random_state).choice(
+    #             len(X), size=min(n_samples, len(X)), replace=False
+    #         )
+    #         X_sampled = X.iloc[indices]
+    #         y_sampled = y.iloc[indices]
 
-        return X_sampled.reset_index(drop=True), pd.Series(y_sampled).reset_index(drop=True)
+    #     return X_sampled.reset_index(drop=True), pd.Series(y_sampled).reset_index(drop=True)
+    def _sample_data(self, X: Union[dd.DataFrame, pd.DataFrame], y: Union[dd.Series, pd.Series]):
+        """
+        Sample a bounded slice of the data for tuning.
+        
+        FIX: Sample X and y together using the same indices to ensure consistent row counts.
+        """
+        import numpy as np
+        
+        # Convert to pandas if Dask
+        if isinstance(X, dd.DataFrame):
+            X_pd = X.compute()
+            y_pd = y.compute()
+        else:
+            X_pd = X
+            y_pd = y
+        
+        # Sample using same indices
+        sample_frac = self.sample_fraction
+        n_samples = int(len(X_pd) * sample_frac)
+        n_samples = min(n_samples, len(X_pd))
+        
+        np.random.seed(self.random_state)
+        indices = np.random.choice(len(X_pd), size=n_samples, replace=False)
+        indices = sorted(indices)
+        
+        X_sampled = X_pd.iloc[indices].reset_index(drop=True)
+        y_sampled = y_pd.iloc[indices].reset_index(drop=True)
+        
+        # Ensure y is a Series
+        if not isinstance(y_sampled, pd.Series):
+            y_sampled = pd.Series(y_sampled)
+        
+        return X_sampled, y_sampled
 
     def _cross_val_score(self, model_cls, params: Dict[str, Any], X: pd.DataFrame, y: pd.Series) -> float:
         """K-fold CV using the model's own fit()/predict_proba(), so tuning

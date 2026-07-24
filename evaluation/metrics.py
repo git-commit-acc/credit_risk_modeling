@@ -11,7 +11,7 @@ from sklearn.metrics import (
     precision_score, recall_score, accuracy_score,
     balanced_accuracy_score, matthews_corrcoef,
     brier_score_loss, log_loss,
-    confusion_matrix
+    confusion_matrix, precision_recall_curve
 )
 from scipy.stats import ks_2samp
 import logging
@@ -86,6 +86,84 @@ class CreditRiskMetrics:
         
         self.metrics = metrics
         return metrics
+    
+    def find_optimal_threshold(
+        self,
+        y_true: Union[np.ndarray, pd.Series, dd.Series],
+        y_proba: Union[np.ndarray, pd.Series, dd.Series],
+        beta: float = 1.0
+    ) -> Dict[str, Any]:
+        """
+        Find the classification threshold that maximizes the F-beta score,
+        instead of using a fixed 0.5 cutoff.
+
+        Under class imbalance, 0.5 is rarely where precision and recall
+        actually balance -- it's just an arbitrary point on the
+        probability scale that depends on how each model happens to be
+        calibrated. Two models with identical ranking ability (same AUC)
+        can report wildly different F1 at a fixed 0.5 threshold simply
+        because one pushes probabilities closer to 0.5 than the other.
+        Searching the precision-recall curve for the actual best threshold
+        makes F1 comparable across models again.
+
+        beta > 1 (e.g. 2.0) weights recall more heavily than precision --
+        appropriate for credit risk, where a missed default (false
+        negative) is typically far costlier than a false-positive review
+        (false positive just costs a loss-mitigation team's time).
+
+        Returns the threshold, the F-beta score achieved there, and the
+        precision/recall/F1 at that same threshold for context.
+        """
+        y_true_np = self._ensure_numpy(y_true)
+        y_proba_np = self._ensure_numpy(y_proba)
+
+        precisions, recalls, thresholds = precision_recall_curve(y_true_np, y_proba_np)
+
+        # precision_recall_curve returns one more precision/recall pair
+        # than thresholds (it appends the (1, 0) point for threshold=inf);
+        # drop that last pair so arrays align.
+        precisions, recalls = precisions[:-1], recalls[:-1]
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            beta_sq = beta ** 2
+            f_beta = (1 + beta_sq) * (precisions * recalls) / (beta_sq * precisions + recalls)
+        f_beta = np.nan_to_num(f_beta, nan=0.0)
+
+        best_idx = np.argmax(f_beta)
+        best_threshold = float(thresholds[best_idx])
+        y_pred_at_best = (y_proba_np >= best_threshold).astype(int)
+
+        return {
+            'threshold': best_threshold,
+            'beta': beta,
+            'f_beta': float(f_beta[best_idx]),
+            'f1': float(f1_score(y_true_np, y_pred_at_best)),
+            'precision': float(precision_score(y_true_np, y_pred_at_best, zero_division=0)),
+            'recall': float(recall_score(y_true_np, y_pred_at_best, zero_division=0)),
+        }
+
+    def evaluate_with_optimal_thresholds(
+        self,
+        y_true: Union[np.ndarray, pd.Series, dd.Series],
+        y_proba: Union[np.ndarray, pd.Series, dd.Series]
+    ) -> Dict[str, Any]:
+        """
+        Convenience wrapper: F1-optimal threshold (clean model-to-model
+        comparison) and F2-optimal threshold (recall-weighted, closer to
+        a credit-risk deployment cutoff), computed from the same curve.
+        """
+        f1_result = self.find_optimal_threshold(y_true, y_proba, beta=1.0)
+        f2_result = self.find_optimal_threshold(y_true, y_proba, beta=2.0)
+        return {
+            'f1_optimal_threshold': f1_result['threshold'],
+            'f1_optimal': f1_result['f1'],
+            'precision_at_f1_optimal': f1_result['precision'],
+            'recall_at_f1_optimal': f1_result['recall'],
+            'f2_optimal_threshold': f2_result['threshold'],
+            'f2_optimal': f2_result['f_beta'],
+            'precision_at_f2_optimal': f2_result['precision'],
+            'recall_at_f2_optimal': f2_result['recall'],
+        }
     
     def _compute_ks(self, y_true: np.ndarray, y_proba: np.ndarray) -> float:
         """Compute Kolmogorov-Smirnov statistic."""

@@ -40,23 +40,16 @@ class DatasetCreator:
         logger.info("STARTING DATASET CREATION PIPELINE")
         logger.info("=" * 80)
         
-        # Load bronze data
         logger.info("Step 1: Loading bronze data...")
-        origination_df, performance_df = self._load_bronze_data()
+        orig_df, perf_df = self._load_bronze_data()
         
-        # Clean data
         logger.info("Step 2: Cleaning data...")
-        orig_cleaned, perf_cleaned = self.cleaner.clean_both_datasets(
-            origination_df, performance_df
-        )
+        orig_cleaned, perf_cleaned = self.cleaner.clean_both_datasets(orig_df, perf_df)
         
-        # Create features
         logger.info("Step 3: Creating features...")
-        feature_df = self.feature_engineer.create_all_features(
-            orig_cleaned, perf_cleaned
-        )
+        feature_df = self.feature_engineer.create_all_features(orig_cleaned, perf_cleaned)
         
-        # Remove duplicate columns before saving
+        # Remove duplicate columns
         seen = set()
         cols_to_keep = []
         for col_name in feature_df.columns:
@@ -65,19 +58,15 @@ class DatasetCreator:
                 cols_to_keep.append(col_name)
         feature_df = feature_df.select(*cols_to_keep)
         
-        # Save intermediate feature dataset
         feature_df = self._save_feature_dataset(feature_df)
         
-        # Create target
         logger.info("Step 4: Creating target...")
         dataset_df = self.target_creator.create_target(feature_df)
         self.target_creator.analyze_target_distribution(dataset_df)
         
-        # Select features for modeling
         logger.info("Step 5: Selecting features for modeling...")
         dataset_df = self._select_model_features(dataset_df)
         
-        # Split data
         logger.info("Step 6: Splitting data...")
         train_df, val_df, test_df = self.splitter.split_data(
             dataset_df,
@@ -88,7 +77,6 @@ class DatasetCreator:
             val_frac=self.model_config.val_frac
         )
         
-        # Save splits
         logger.info("Step 7: Saving data splits...")
         self._save_splits(train_df, val_df, test_df)
         
@@ -99,72 +87,33 @@ class DatasetCreator:
         return train_df, val_df, test_df
     
     def _load_bronze_data(self) -> Tuple[DataFrame, DataFrame]:
-        """Load bronze layer data."""
-        origination_df = self.spark.read.parquet(self.paths.origination_bronze)
-        performance_df = self.spark.read.parquet(self.paths.performance_bronze)
-        
-        logger.info(f"  Origination: {origination_df.count():,} loans")
-        logger.info(f"  Performance: {performance_df.count():,} records")
-        
-        return origination_df, performance_df
+        orig = self.spark.read.parquet(self.paths.origination_bronze)
+        perf = self.spark.read.parquet(self.paths.performance_bronze)
+        logger.info(f"  Origination: {orig.count():,} loans")
+        logger.info(f"  Performance: {perf.count():,} records")
+        return orig, perf
     
     def _save_feature_dataset(self, df: DataFrame) -> DataFrame:
-        """Save feature dataset to disk."""
-        output_path = self.paths.feature_dataset
-        
-        df.write.mode("overwrite").option("compression", "snappy").parquet(output_path)
-        logger.info(f"  Feature dataset saved to: {output_path}")
-        
+        path = self.paths.feature_dataset
+        df.write.mode("overwrite").option("compression", "snappy").parquet(path)
+        logger.info(f"  Feature dataset saved to: {path}")
         return df
     
-    # def _select_model_features(self, df: DataFrame) -> DataFrame:
-    #     """Select features for modeling."""
-    #     # Get all columns except drop features
-    #     drop_features = self.feature_config.drop_features + ['row_num', 'cumulative_delinquency']
-    #     available_cols = df.columns
-        
-    #     # Get static and behavioral features
-    #     feature_cols = (
-    #         self.feature_config.static_features +
-    #         self.feature_config.behavioral_features
-    #     )
-        
-    #     # Only keep features that exist
-    #     feature_cols = [c for c in feature_cols if c in available_cols]
-        
-    #     # Add target and loan identifier
-    #     select_cols = ["LOAN_SEQUENCE_NUMBER", "MONTHLY_REPORTING_PERIOD", "target"] + feature_cols
-    #     select_cols = [c for c in select_cols if c in available_cols and c not in drop_features]
-        
-    #     return df.select(*select_cols)
     def _select_model_features(self, df: DataFrame) -> DataFrame:
-        """
-        Select features for modeling by excluding drop_features.
-        Keeps LOAN_SEQUENCE_NUMBER, MONTHLY_REPORTING_PERIOD, and target.
-        """
-        # Features to drop (config + additional)
         drop_features = list(self.feature_config.drop_features)
         drop_features.extend(['row_num', 'cumulative_delinquency'])
         
-        available_cols = df.columns
-        
-        # Always keep these
         keep_cols = ["LOAN_SEQUENCE_NUMBER", "MONTHLY_REPORTING_PERIOD", "target"]
-        
-        # Add all other columns not in drop_features
         select_cols = keep_cols.copy()
-        for col in available_cols:
+        
+        for col in df.columns:
             if col not in drop_features and col not in select_cols:
                 select_cols.append(col)
         
-        # Log what's being kept/dropped
         logger.info(f"  Selecting {len(select_cols)} columns for modeling")
-        logger.info(f"  Dropping {len([c for c in available_cols if c not in select_cols])} columns")
-        
         return df.select(*select_cols)
-
+    
     def _save_splits(self, train_df, val_df, test_df):
-        """Save data splits to disk."""
         train_df.write.mode("overwrite").parquet(self.paths.train_data)
         val_df.write.mode("overwrite").parquet(self.paths.val_data)
         test_df.write.mode("overwrite").parquet(self.paths.test_data)

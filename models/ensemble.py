@@ -17,10 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class StackingEnsemble(BaseCreditRiskModel):
-    """
-    Stacking ensemble using sklearn's StackingClassifier.
-    Excludes CatBoost (not cloneable by sklearn).
-    """
+    """Stacking ensemble using sklearn's StackingClassifier."""
     
     def __init__(
         self,
@@ -37,7 +34,6 @@ class StackingEnsemble(BaseCreditRiskModel):
         for model in base_models:
             model_name = model.name.lower().replace(' ', '_')
             
-            # CatBoost cannot be cloned by sklearn
             if 'catboost' in model_name:
                 logger.info(f"  Skipping {model.name} for ensemble")
                 continue
@@ -56,13 +52,26 @@ class StackingEnsemble(BaseCreditRiskModel):
             return data.compute()
         return data
     
-    def _ensure_numeric(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Ensure all columns are numeric."""
-        X_numeric = X.copy()
-        for col in X_numeric.columns:
-            if X_numeric[col].dtype == 'object':
-                X_numeric[col] = pd.to_numeric(X_numeric[col], errors='coerce')
-        return X_numeric.fillna(0)
+    def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Encode categorical columns."""
+        X_encoded = X.copy()
+        
+        for col in X_encoded.columns:
+            if pd.api.types.is_object_dtype(X_encoded[col]) or \
+               pd.api.types.is_string_dtype(X_encoded[col]) or \
+               pd.api.types.is_categorical_dtype(X_encoded[col]):
+                
+                X_encoded[col] = X_encoded[col].fillna('MISSING')
+                X_encoded[col] = X_encoded[col].astype(str)
+                X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
+                X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
+                
+                if X_encoded[col].nunique() <= 1:
+                    X_encoded[col] = 0
+                else:
+                    X_encoded[col] = X_encoded[col].astype('category').cat.codes
+        
+        return X_encoded
     
     def fit(
         self,
@@ -79,14 +88,15 @@ class StackingEnsemble(BaseCreditRiskModel):
         y_train_pd = self._ensure_pandas(y_train)
         self.feature_names = X_train_pd.columns.tolist()
         
-        X_train_clean = self._ensure_numeric(X_train_pd)
+        X_train_encoded = self._encode_categorical(X_train_pd)
+        X_train_encoded = X_train_encoded.fillna(0)
         
         if len(self.sklearn_models) < 2:
             logger.warning(f"Need at least 2 models for ensemble (have {len(self.sklearn_models)})")
             if len(self.sklearn_models) == 1:
                 logger.info("Using single model as fallback...")
                 self.model = self.sklearn_models[0][1]
-                self.model.fit(X_train_clean, y_train_pd)
+                self.model.fit(X_train_encoded, y_train_pd)
             return self
         
         final_estimator = LogisticRegression(
@@ -104,7 +114,7 @@ class StackingEnsemble(BaseCreditRiskModel):
             n_jobs=-1
         )
         
-        self.model.fit(X_train_clean, y_train_pd)
+        self.model.fit(X_train_encoded, y_train_pd)
         
         logger.info(f"{self.name} completed with {len(self.sklearn_models)} base models.")
         return self
@@ -115,20 +125,19 @@ class StackingEnsemble(BaseCreditRiskModel):
             raise ValueError("Ensemble not trained. Call fit() first.")
         
         X_pd = self._ensure_pandas(X)
-        X_clean = self._ensure_numeric(X_pd)
+        X_encoded = self._encode_categorical(X_pd)
+        X_encoded = X_encoded.fillna(0)
         
         if not hasattr(self.model, 'predict_proba'):
-            return self.model.predict_proba(X_clean)
+            return self.model.predict_proba(X_encoded)
         
-        return self.model.predict_proba(X_clean)
+        return self.model.predict_proba(X_encoded)
     
     def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict classes."""
         probs = self.predict_proba(X)
         return (probs[:, 1] >= 0.5).astype(int)
     
     def get_feature_importance(self) -> Dict[str, float]:
-        """Get feature importance from meta-learner."""
         if hasattr(self.model, 'final_estimator_'):
             if hasattr(self.model.final_estimator_, 'coef_'):
                 coef = self.model.final_estimator_.coef_[0]

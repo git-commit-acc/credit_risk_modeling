@@ -1,0 +1,7 @@
+{
+  "logistic": {},
+  "random_forest": {},
+  "xgboost": {},
+  "lightgbm": {},
+  "catboost": {}
+}

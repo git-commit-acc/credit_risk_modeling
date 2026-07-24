@@ -1,83 +1,6 @@
 # preprocessing/cleaning.py
 """
 Data cleaning for Freddie Mac SFLLD data based on the Data Dictionary.
-
-OFFICIAL SFLLD DATA DICTIONARY - ORIGINATION FIELDS
-=====================================================
-
-Field Name               | Valid Values           | Invalid/Exception Values | Type    | Notes
--------------------------|------------------------|--------------------------|---------|-------------------------
-CREDIT_SCORE             | 300-850                | 9999 = Not Available     | Numeric | <300 or >850 → NULL
-FIRST_PAYMENT_DATE       | YYYYMM                 | Any other format         | Date    | 6 chars
-FIRST_TIME_HOMEBUYER_FLAG| Y, N                   | 9 = Not Available        | Alpha   | 1 char
-MATURITY_DATE            | YYYYMM                 | Any other format         | Date    | 6 chars
-MSA                      | 5-digit code           | NULL allowed             | Alpha   | 5 digits
-MI_PERCENTAGE            | 0-100                  | 999 = Not Available      | Numeric | 
-NUMBER_OF_UNITS          | 1-4                    | 9 = Not Available        | Numeric |
-OCCUPANCY_STATUS         | P, S, I                | 9 = Not Available        | Alpha   | P=Primary, S=Second, I=Investor
-ORIGINAL_CLTV            | 0-200                  | 999 = Not Available      | Numeric |
-ORIGINAL_DTI             | 0-65%                  | 999 = Not Available      | Numeric | >65% → NULL (HARP = 999)
-ORIGINAL_UPB             | Amount (rounded)       | N/A                      | Numeric | Rounded to $1,000
-ORIGINAL_LTV             | 6-105% (non-HARP)      | 999 = Not Available      | Numeric | HARP: 1-998%
-ORIGINAL_INTEREST_RATE   | Rate as decimal        | N/A                      | Numeric | 0-30%
-CHANNEL                  | R, B, C, T             | 9 = Not Available        | Alpha   | R=Retail, B=Broker, C=Correspondent, T=TPO
-PPM_FLAG                 | Y, N                   | N/A                      | Alpha   |
-AMORTIZATION_TYPE        | FRM, ARM, IO           | 9 = Not Available        | Alpha   |
-PROPERTY_STATE           | US State abbrev        | Invalid states → NULL    | Alpha   | 2 chars
-PROPERTY_TYPE            | SF, CONDO, COOP, PUD,  | 9 = Not Available        | Alpha   |
-                         | MH                     |                          |         |
-POSTAL_CODE              | 5-digit                | Masked: last 2 digits→00 | Alpha   | 5 chars
-LOAN_SEQUENCE_NUMBER     | Unique ID              | N/A                      | Alpha   | Primary Key
-LOAN_PURPOSE             | P, R, C                | 9 = Not Available        | Alpha   | P=Purchase, R=Refinance, C=Cash-out
-ORIGINAL_LOAN_TERM       | 60-480                 | Invalid → NULL           | Numeric |
-NUMBER_OF_BORROWERS      | 1-10                   | 99 = Not Available       | Numeric |
-SELLER_NAME              | Name or "Other Sellers"| N/A                      | Alpha   | Masked if <1% UPB
-SERVICER_NAME            | Name or "Other Servicers"| N/A                   | Alpha   | Masked if <1% UPB
-SUPER_CONFORMING_FLAG    | Y, ' '                 | N/A                      | Alpha   |
-PRE_RELIEF_REFINANCE_LSN | Loan Sequence Number   | NULL for non-relief      | Alpha   |
-SPECIAL_ELIGIBILITY_PROGRAM| H, F, R, ' '         | N/A                      | Alpha   |
-RELIEF_REFINANCE_INDICATOR| Y, N, ' '             | N/A                      | Alpha   |
-PROPERTY_VALUATION_METHOD | Numeric code          | N/A                      | Numeric |
-IO_INDICATOR             | Y, N, 9                | N/A                      | Alpha   |
-MI_CANCELLATION_INDICATOR| Various                | N/A                      | Alpha   |
-
-OFFICIAL SFLLD DATA DICTIONARY - PERFORMANCE FIELDS
-====================================================
-
-Field Name               | Valid Values           | Invalid/Exception Values | Type    | Notes
--------------------------|------------------------|--------------------------|---------|-------------------------
-LOAN_SEQUENCE_NUMBER     | Unique ID              | N/A                      | Alpha   | Primary Key
-MONTHLY_REPORTING_PERIOD | YYYYMM                 | N/A                      | Date    | 6 chars
-CURRENT_ACTUAL_UPB       | Amount                 | N/A                      | Numeric | Rounded if age≤6m
-CURRENT_LOAN_DELINQUENCY_STATUS| 0-9, RA          | Any other value          | Alpha   | 0=Current, RA=REO
-LOAN_AGE                 | Calculated             | N/A                      | Numeric | Months since origination
-REMAINING_MONTHS_TO_LEGAL_MATURITY| Calculated   | N/A                      | Numeric |
-DEFECT_SETTLEMENT_DATE   | YYYYMM                 | NULL if none             | Date    |
-MODIFICATION_FLAG        | Y, P, NULL             | N/A                      | Alpha   | Y=Current, P=Prior
-ZERO_BALANCE_CODE        | 01,02,03,09,15,16,96   | NULL if active           | Alpha   |
-ZERO_BALANCE_EFFECTIVE_DATE| YYYYMM              | NULL if active           | Date    |
-CURRENT_INTEREST_RATE    | 0-30%                  | Invalid → NULL           | Numeric |
-CURRENT_NON_INTEREST_BEARING_UPB| Amount           | N/A                      | Numeric |
-DDLPI                    | YYYYMM                 | N/A                      | Date    | Due Date Last Paid Installment
-MI_RECOVERIES            | Amount                 | NULL if none/defect      | Numeric |
-NET_SALE_PROCEEDS        | Amount                 | NULL if none/defect      | Numeric |
-NON_MI_RECOVERIES        | Amount                 | NULL if none/defect      | Numeric |
-TOTAL_EXPENSES           | Amount                 | NULL if none/defect      | Numeric |
-LEGAL_COSTS              | Amount                 | NULL if none/defect      | Numeric |
-MAINTENANCE_AND_PRESERVATION_COSTS| Amount         | NULL if none/defect      | Numeric |
-TAXES_AND_INSURANCE      | Amount                 | NULL if none/defect      | Numeric |
-MISCELLANEOUS_EXPENSES   | Amount                 | NULL if none/defect      | Numeric |
-ACTUAL_LOSS_CALCULATION  | Amount                 | NULL if none/defect      | Numeric |
-CUMULATIVE_MODIFICATION_COST| Amount              | N/A                      | Numeric |
-INTEREST_RATE_STEP_INDICATOR| Y, N, NULL          | N/A                      | Alpha   |
-PAYMENT_DEFERRAL_FLAG    | Y, P, NULL             | N/A                      | Alpha   |
-ELTV                     | Ratio                  | N/A                      | Numeric |
-ZERO_BALANCE_REMOVAL_UPB | Amount                 | NULL if active           | Numeric |
-DELINQUENT_ACCRUED_INTEREST| Amount              | NULL if none             | Numeric |
-DELINQUENCY_DUE_TO_DISASTER| Y, N, NULL          | N/A                      | Alpha   |
-BORROWER_ASSISTANCE_STATUS_CODE| T, F, R, NULL   | N/A                      | Alpha   |
-CURRENT_MONTH_MODIFICATION_COST| Amount          | N/A                      | Numeric |
-INTEREST_BEARING_UPB     | Amount                 | N/A                      | Numeric |
 """
 
 from pyspark.sql import SparkSession, DataFrame
@@ -191,10 +114,9 @@ class SFLLDDataCleaner:
             else:
                 when_expr = when_expr.when(condition, lit(code))
         
+        # WORKING VERSION - DO NOT CHANGE
         if when_expr is not None:
             df = df.withColumn(column, when_expr.otherwise(lit(None)))
-        else:
-            df = df.withColumn(column, lit(None))
         
         return df
     
@@ -322,15 +244,6 @@ class SFLLDDataCleaner:
         # AMORTIZATION_TYPE: Encode to numeric
         df = self._encode_categorical(df, "AMORTIZATION_TYPE", AMORTIZATION_TYPE)
         
-        # PROPERTY_STATE: Validate US states
-        df = df.withColumn(
-            "PROPERTY_STATE",
-            when(
-                col("PROPERTY_STATE").isin(self.VALID_STATES),
-                col("PROPERTY_STATE")
-            ).otherwise(lit(None))
-        )
-        
         # PROPERTY_TYPE: Encode to numeric
         df = self._encode_categorical(df, "PROPERTY_TYPE", PROPERTY_TYPE)
         
@@ -384,9 +297,6 @@ class SFLLDDataCleaner:
         
         # MI_CANCELLATION_INDICATOR: Encode to numeric
         df = self._encode_categorical(df, "MI_CANCELLATION_INDICATOR", MI_CANCELLATION_INDICATOR)
-        
-        # Keep MSA as string (categorical with many values)
-        # Keep SELLER_NAME, SERVICER_NAME as string (masked by Freddie Mac)
         
         logger.info("Origination data cleaning completed.")
         return df

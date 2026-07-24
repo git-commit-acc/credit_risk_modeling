@@ -1,11 +1,11 @@
 # models/base.py
 """
-Base model class for credit risk modeling with Dask support.
+Base model class for credit risk modeling.
 """
 
 from abc import ABC, abstractmethod
 import logging
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Optional, Union
 import dask.dataframe as dd
 import pandas as pd
 import numpy as np
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class BaseCreditRiskModel(ABC):
-    """Base class for credit risk models with Dask support."""
+    """Base class for credit risk models."""
 
     def __init__(self, name: str, random_state: int = 42):
         self.name = name
@@ -27,48 +27,32 @@ class BaseCreditRiskModel(ABC):
         self.is_dask_model = False
 
     @abstractmethod
-    def fit(self, X_train: Union[dd.DataFrame, pd.DataFrame], y_train: Union[dd.Series, pd.Series], **kwargs):
+    def fit(self, X_train, y_train, **kwargs):
         """Train the model."""
         pass
 
     @abstractmethod
-    def predict_proba(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
+    def predict_proba(self, X):
         """Predict probabilities."""
         pass
 
-    def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
+    def predict(self, X):
         """Predict classes."""
         probs = self.predict_proba(X)
         return (probs[:, 1] >= 0.5).astype(int)
 
     def get_feature_importance(self) -> Dict[str, float]:
         """Get feature importance if available."""
-        if self.feature_importance is not None:
-            return self.feature_importance
-        return {}
+        return self.feature_importance if self.feature_importance else {}
 
-    def set_feature_names(self, feature_names: list):
-        """Set feature names for the model."""
-        self.feature_names = feature_names
-
-    def _ensure_pandas(self, data: Union[dd.DataFrame, pd.DataFrame]) -> pd.DataFrame:
-        """Convert Dask to Pandas if needed for non-Dask models.
-
-        NOTE: this still triggers a `.compute()` and should only be used on
-        data that is already known to be small (e.g. a validation fold, or
-        meta-features with one column per base model) -- never on the full
-        feature matrix. Dask-native models (xgboost, lightgbm, random
-        forest, logistic) never call this on X_train/X of arbitrary size;
-        see their individual modules.
-        """
-        if isinstance(data, dd.DataFrame):
-            return data.compute()
-        if isinstance(data, dd.Series):
+    def _ensure_pandas(self, data):
+        """Convert Dask to pandas if needed."""
+        if isinstance(data, (dd.DataFrame, dd.Series)):
             return data.compute()
         return data
 
-    def _ensure_dask(self, data: Union[dd.DataFrame, pd.DataFrame], npartitions: int = 8) -> dd.DataFrame:
-        """Convert Pandas to Dask if needed (lazy wrap, no compute)."""
+    def _ensure_dask(self, data, npartitions: int = 8):
+        """Convert pandas to Dask if needed."""
         return ensure_dask_dataframe(data, npartitions=npartitions)
 
     def __str__(self):

@@ -192,12 +192,15 @@ class CreditRiskPipeline:
     # (identifiers + target) that must be excluded from the X feature matrix.
     _NON_FEATURE_COLUMNS = ['LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD', 'target']
 
+    # =============================================================================
+    # DATA LOADING - Uses sampled data when enabled
+    # =============================================================================
+
     def _load_existing_data(self) -> bool:
         """Load existing data with sampling."""
         logger.info("Loading train/val/test splits...")
 
         try:
-            # Use sampled data if available and enabled
             if self.model_config.use_sample:
                 train_path = self.paths.sampled_train_data
                 val_path = self.paths.sampled_val_data
@@ -211,7 +214,6 @@ class CreditRiskPipeline:
             train_ddf = dd.read_parquet(train_path)
             test_ddf = dd.read_parquet(test_path)
             
-            # Repartition
             target_partitions = 16
             train_ddf = train_ddf.repartition(npartitions=target_partitions)
             test_ddf = test_ddf.repartition(npartitions=target_partitions)
@@ -227,7 +229,6 @@ class CreditRiskPipeline:
             self.state['feature_names'] = list(self.state['X_train'].columns)
             self.state['data_loaded'] = True
 
-            logger.info("Successfully loaded existing data (Dask, lazy):")
             logger.info(f"  Train: {len(self.state['X_train']):,} records")
             logger.info(f"  Test: {len(self.state['X_test']):,} records")
             if self.state.get('X_val') is not None:
@@ -474,7 +475,24 @@ class CreditRiskPipeline:
         """Run hyperparameter tuning module with Dask."""
         logger.info("Running Hyperparameter Tuning Module with Dask...")
         
-        self._ensure_data_loaded("tuning")
+        # FIX: Load SAMPLED data if use_sample is True
+        if self.model_config.use_sample:
+            logger.info("  Using SAMPLED data for tuning...")
+            # Load sampled data directly
+            train_path = self.paths.sampled_train_data
+            val_path = self.paths.sampled_val_data
+            test_path = self.paths.sampled_test_data
+            
+            X_train = dd.read_parquet(train_path)
+            y_train = X_train['target']
+            X_train = X_train.drop(columns=['target', 'LOAN_SEQUENCE_NUMBER', 'MONTHLY_REPORTING_PERIOD'])
+            
+            # Set state so other methods work
+            self.state['X_train'] = X_train
+            self.state['y_train'] = y_train
+            self.state['data_loaded'] = True
+        else:
+            self._ensure_data_loaded("tuning")
         
         n_trials = kwargs.get('n_trials', self.model_config.n_trials)
         
@@ -493,6 +511,8 @@ class CreditRiskPipeline:
             random_state=self.model_config.random_state,
             sample_fraction=0.1  # Use 10% for tuning
         )
+        
+        # ... rest of tuning code ...
         
         tuned_params = {}
         
@@ -564,6 +584,10 @@ class CreditRiskPipeline:
         logger.info("Progress logger stopped")
 
 
+    # =============================================================================
+    # MODEL TRAINING - All 6 models with error handling
+    # =============================================================================
+
     def _run_training(self, **kwargs):
         """Run model training module with Dask."""
         import time
@@ -632,7 +656,7 @@ class CreditRiskPipeline:
         if specific_model in ['all', 'logistic']:
             if 'logistic' not in models or force:
                 logger.info("\n" + "=" * 60)
-                logger.info("Training Logistic Regression with Dask...")
+                logger.info("Training Logistic Regression (sklearn API)...")
                 logger.info("=" * 60)
                 self.state['current_model'] = 'Logistic Regression'
                 start_time = time.time()
@@ -641,16 +665,17 @@ class CreditRiskPipeline:
                     if 'random_state' not in lr_params:
                         lr_params['random_state'] = self.model_config.random_state
                     
+                    # Use sklearn LogisticRegression
                     lr = LogisticRegressionModel(**lr_params)
                     lr.fit(X_train_sampled, y_train_sampled)
                     models['logistic'] = lr
                     elapsed = time.time() - start_time
-                    logger.info(f" Logistic Regression completed in {elapsed/60:.1f} min")
+                    logger.info(f"Logistic Regression completed in {elapsed/60:.1f} min")
                     if 'logistic' not in self.state['models_completed']:
                         self.state['models_completed'].append('logistic')
                 except Exception as e:
                     elapsed = time.time() - start_time
-                    logger.warning(f" Logistic Regression failed after {elapsed/60:.1f} min: {e}")
+                    logger.warning(f"Logistic Regression failed: {e}")
                     failed_models.append('logistic')
             else:
                 logger.info("Skipping Logistic Regression (Already trained)")
@@ -658,49 +683,86 @@ class CreditRiskPipeline:
         # ============================================================
         # 2. RANDOM FOREST (10% sample)
         # ============================================================
+        # if specific_model in ['all', 'random_forest']:
+        #     if 'random_forest' not in models or force:
+        #         logger.info("\n" + "=" * 60)
+        #         logger.info("Training Random Forest with Dask (10% sample)...")
+        #         logger.info("=" * 60)
+        #         self.state['current_model'] = 'Random Forest'
+        #         start_time = time.time()
+        #         try:
+        #             logger.info("  Downsampling to 10% specifically for Random Forest...")
+                    
+        #             # FIX: Convert to pandas first, then sample (works reliably)
+        #             logger.info("  Converting training data to pandas (for sampling)...")
+        #             X_train_pd = self.state['X_train'].compute()
+        #             y_train_pd = self.state['y_train'].compute()
+                    
+        #             total_rows = len(X_train_pd)
+        #             sample_frac = 0.1
+        #             sample_size = int(total_rows * sample_frac)
+        #             logger.info(f"  Total rows: {total_rows:,}, sampling {sample_size:,} rows")
+                    
+        #             # Sample using pandas (reliable)
+        #             import numpy as np
+        #             np.random.seed(42)
+        #             indices = np.random.choice(total_rows, size=sample_size, replace=False)
+        #             indices = sorted(indices)
+                    
+        #             X_rf_sample = X_train_pd.iloc[indices]
+        #             y_rf_sample = y_train_pd.iloc[indices]
+                    
+        #             # Reset indices
+        #             X_rf_sample = X_rf_sample.reset_index(drop=True)
+        #             y_rf_sample = y_rf_sample.reset_index(drop=True)
+                    
+        #             logger.info(f"  Sampled X: {len(X_rf_sample):,}, Sampled y: {len(y_rf_sample):,}")
+                    
+        #             if len(X_rf_sample) != len(y_rf_sample):
+        #                 raise ValueError(f"Sample mismatch: X={len(X_rf_sample)}, y={len(y_rf_sample)}")
+                    
+        #             rf_params = tuned_params.get('random_forest', {})
+        #             rf_params.update({
+        #                 'random_state': self.model_config.random_state,
+        #                 'n_estimators': 50,
+        #                 'max_depth': 8,
+        #             })
+                    
+        #             rf = RandomForestModel(**rf_params)
+        #             rf.fit(X_rf_sample, y_rf_sample)
+        #             models['random_forest'] = rf
+        #             elapsed = time.time() - start_time
+        #             logger.info(f"Random Forest completed in {elapsed/60:.1f} min")
+        #             if 'random_forest' not in self.state['models_completed']:
+        #                 self.state['models_completed'].append('random_forest')
+        #         except Exception as e:
+        #             elapsed = time.time() - start_time
+        #             import traceback
+        #             logger.warning(f"Random Forest failed after {elapsed/60:.1f} min: {e}")
+        #             logger.debug(traceback.format_exc())
+        #             failed_models.append('random_forest')
+        #     else:
+        #         logger.info("Skipping Random Forest (Already trained)")
         if specific_model in ['all', 'random_forest']:
             if 'random_forest' not in models or force:
                 logger.info("\n" + "=" * 60)
-                logger.info("Training Random Forest with Dask (10% sample)...")
+                logger.info("Training Random Forest...")
                 logger.info("=" * 60)
                 self.state['current_model'] = 'Random Forest'
                 start_time = time.time()
                 try:
-                    logger.info("  Downsampling to 10% specifically for Random Forest...")
+                    # REMOVED: Downsampling to 10% (not needed with sampled data)
+                    # Use the same sampled data as other models
+                    X_rf_sample = X_train_sampled
+                    y_rf_sample = y_train_sampled
                     
-                    # FIX: Convert to pandas first, then sample (works reliably)
-                    logger.info("  Converting training data to pandas (for sampling)...")
-                    X_train_pd = self.state['X_train'].compute()
-                    y_train_pd = self.state['y_train'].compute()
-                    
-                    total_rows = len(X_train_pd)
-                    sample_frac = 0.1
-                    sample_size = int(total_rows * sample_frac)
-                    logger.info(f"  Total rows: {total_rows:,}, sampling {sample_size:,} rows")
-                    
-                    # Sample using pandas (reliable)
-                    import numpy as np
-                    np.random.seed(42)
-                    indices = np.random.choice(total_rows, size=sample_size, replace=False)
-                    indices = sorted(indices)
-                    
-                    X_rf_sample = X_train_pd.iloc[indices]
-                    y_rf_sample = y_train_pd.iloc[indices]
-                    
-                    # Reset indices
-                    X_rf_sample = X_rf_sample.reset_index(drop=True)
-                    y_rf_sample = y_rf_sample.reset_index(drop=True)
-                    
-                    logger.info(f"  Sampled X: {len(X_rf_sample):,}, Sampled y: {len(y_rf_sample):,}")
-                    
-                    if len(X_rf_sample) != len(y_rf_sample):
-                        raise ValueError(f"Sample mismatch: X={len(X_rf_sample)}, y={len(y_rf_sample)}")
+                    logger.info(f"  Training with {len(X_rf_sample):,} samples, {len(X_rf_sample.columns)} features")
                     
                     rf_params = tuned_params.get('random_forest', {})
                     rf_params.update({
                         'random_state': self.model_config.random_state,
-                        'n_estimators': 50,
-                        'max_depth': 8,
+                        'n_estimators': 100,  # Increase back to 100 (was 50 due to downsampling)
+                        'max_depth': 10,
                     })
                     
                     rf = RandomForestModel(**rf_params)
@@ -759,8 +821,6 @@ class CreditRiskPipeline:
         # ============================================================
         # 4. LightGBM
         # ============================================================
-
-                # 4. LightGBM
         if specific_model in ['all', 'lightgbm']:
             if 'lightgbm' not in models or force:
                 logger.info("\n" + "=" * 60)
@@ -828,17 +888,20 @@ class CreditRiskPipeline:
         # ============================================================
         # 6. ENSEMBLE
         # ============================================================
+        # In _run_training(), Ensemble section:
+
+        # 6. ENSEMBLE (with Logistic Regression)
         if specific_model in ['all', 'ensemble']:
             if 'ensemble' not in models or force:
-                # Get models strictly excluding CatBoost and Logistic Regression
+                # Include Logistic Regression in ensemble
                 valid_base_models = [
                     m for name, m in models.items() 
-                    if name not in ['catboost', 'logistic', 'ensemble']
+                    if name not in ['catboost', 'ensemble']  # Only exclude CatBoost
                 ]
                 
                 if len(valid_base_models) >= 2:
                     logger.info("\n" + "=" * 60)
-                    logger.info(f"Training Stacking Ensemble with base models: {[m.name for m in valid_base_models]}...")
+                    logger.info(f"Training Ensemble with {[m.name for m in valid_base_models]}...")
                     logger.info("=" * 60)
                     self.state['current_model'] = 'Ensemble'
                     start_time = time.time()
@@ -855,15 +918,15 @@ class CreditRiskPipeline:
                         ensemble.fit(X_train_sampled, y_train_sampled, X_val_sampled, y_val_sampled)
                         models['ensemble'] = ensemble
                         elapsed = time.time() - start_time
-                        logger.info(f" Ensemble completed in {elapsed/60:.1f} min")
+                        logger.info(f"Ensemble completed in {elapsed/60:.1f} min")
                         if 'ensemble' not in self.state['models_completed']:
                             self.state['models_completed'].append('ensemble')
                     except Exception as e:
                         elapsed = time.time() - start_time
-                        logger.warning(f" Ensemble failed after {elapsed/60:.1f} min: {e}")
+                        logger.warning(f"Ensemble failed: {e}")
                         failed_models.append('ensemble')
                 else:
-                    logger.warning(f"Skipping Ensemble: Need at least 2 valid base models. Found {len(valid_base_models)}.")
+                    logger.warning(f"Skipping Ensemble: Need at least 2 models, found {len(valid_base_models)}")
             else:
                 logger.info("Skipping Ensemble (Already trained)")
         
@@ -915,6 +978,9 @@ class CreditRiskPipeline:
             # Compute metrics
             metrics = metrics_calculator.evaluate(y_test_np, y_pred, y_proba)
             metrics['name'] = name
+
+            optimal = metrics_calculator.evaluate_with_optimal_thresholds(y_test_np, y_proba)
+            metrics.update(optimal)
             
             if hasattr(model, 'get_feature_importance'):
                 metrics['feature_importance'] = model.get_feature_importance()
@@ -926,9 +992,12 @@ class CreditRiskPipeline:
             
             logger.info(f"  ROC-AUC: {metrics['roc_auc']:.4f}")
             logger.info(f"  PR-AUC: {metrics['pr_auc']:.4f}")
-            logger.info(f"  F1: {metrics['f1']:.4f}")
+            logger.info(f"  F1 (0.5 threshold): {metrics['f1']:.4f}")
+            logger.info(f"  F1 (optimal threshold={metrics['f1_optimal_threshold']:.3f}): {metrics['f1_optimal']:.4f}")
+            logger.info(f"  F2 (optimal threshold={metrics['f2_optimal_threshold']:.3f}): {metrics['f2_optimal']:.4f}"
+                        f"  [precision={metrics['precision_at_f2_optimal']:.3f}, recall={metrics['recall_at_f2_optimal']:.3f}]")
             logger.info(f"  KS: {metrics['ks_statistic']:.4f}")
-        
+
         self.state['results'] = results
         
         # Save results
@@ -944,7 +1013,13 @@ class CreditRiskPipeline:
                 'mcc': metrics['mcc'],
                 'brier_score': metrics['brier_score'],
                 'log_loss': metrics['log_loss'],
-                'ks_statistic': metrics['ks_statistic']
+                'ks_statistic': metrics['ks_statistic'],
+                'f1_optimal_threshold': metrics['f1_optimal_threshold'],
+                'f1_optimal': metrics['f1_optimal'],
+                'f2_optimal_threshold': metrics['f2_optimal_threshold'],
+                'f2_optimal': metrics['f2_optimal'],
+                'precision_at_f2_optimal': metrics['precision_at_f2_optimal'],
+                'recall_at_f2_optimal': metrics['recall_at_f2_optimal'],
             }
             for name, metrics in results.items()
         ])

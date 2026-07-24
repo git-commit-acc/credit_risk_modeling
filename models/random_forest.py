@@ -46,13 +46,30 @@ class RandomForestModel(BaseCreditRiskModel):
             return data.compute()
         return data
     
-    def _ensure_numeric(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Ensure all columns are numeric."""
-        X_numeric = X.copy()
-        for col in X_numeric.columns:
-            if X_numeric[col].dtype == 'object':
-                X_numeric[col] = pd.to_numeric(X_numeric[col], errors='coerce')
-        return X_numeric.fillna(0)
+    def _encode_categorical(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Encode categorical columns for models."""
+        X_encoded = X.copy()
+        
+        for col in X_encoded.columns:
+            # Check for object, string, or category dtype
+            if pd.api.types.is_object_dtype(X_encoded[col]) or \
+               pd.api.types.is_string_dtype(X_encoded[col]) or \
+               pd.api.types.is_categorical_dtype(X_encoded[col]):
+                
+                # Fill missing and convert to string
+                X_encoded[col] = X_encoded[col].fillna('MISSING')
+                X_encoded[col] = X_encoded[col].astype(str)
+                X_encoded[col] = X_encoded[col].replace('nan', 'MISSING')
+                X_encoded[col] = X_encoded[col].replace('None', 'MISSING')
+                X_encoded[col] = X_encoded[col].replace('', 'MISSING')
+                
+                # Convert to categorical codes
+                if X_encoded[col].nunique() <= 1:
+                    X_encoded[col] = 0
+                else:
+                    X_encoded[col] = X_encoded[col].astype('category').cat.codes
+        
+        return X_encoded
     
     def fit(
         self,
@@ -67,7 +84,11 @@ class RandomForestModel(BaseCreditRiskModel):
         y_train_pd = self._ensure_pandas(y_train)
         self.feature_names = X_train_pd.columns.tolist()
         
-        X_train_clean = self._ensure_numeric(X_train_pd)
+        # Encode categorical columns
+        X_train_encoded = self._encode_categorical(X_train_pd)
+        
+        # Fill NaN with 0
+        X_train_encoded = X_train_encoded.fillna(0)
         
         self.model = RandomForestClassifier(
             n_estimators=self.n_estimators,
@@ -79,7 +100,7 @@ class RandomForestModel(BaseCreditRiskModel):
             random_state=self.random_state,
             n_jobs=self.n_jobs,
         )
-        self.model.fit(X_train_clean, y_train_pd)
+        self.model.fit(X_train_encoded, y_train_pd)
 
         self.feature_importance = dict(
             zip(self.feature_names, self.model.feature_importances_)
@@ -94,20 +115,18 @@ class RandomForestModel(BaseCreditRiskModel):
             raise ValueError("Model not trained. Call fit() first.")
         
         X_pd = self._ensure_pandas(X)
-        X_clean = self._ensure_numeric(X_pd)
-        return self.model.predict_proba(X_clean)
+        X_encoded = self._encode_categorical(X_pd)
+        X_encoded = X_encoded.fillna(0)
+        return self.model.predict_proba(X_encoded)
     
     def predict(self, X: Union[dd.DataFrame, pd.DataFrame]) -> np.ndarray:
-        """Predict classes."""
         probs = self.predict_proba(X)
         return (probs[:, 1] >= 0.5).astype(int)
     
     def get_feature_importance(self) -> Dict[str, float]:
-        """Get feature importance."""
         return self.feature_importance if self.feature_importance else {}
     
     def get_params(self, deep=True):
-        """Get model parameters."""
         return {
             'n_estimators': self.n_estimators,
             'max_depth': self.max_depth,
